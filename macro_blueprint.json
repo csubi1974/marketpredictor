@@ -1,0 +1,17 @@
+{
+  "week_starting": "2026-02-15",
+  "events": [
+    {"Fecha": "Feb 17, 2026", "Hora": "08:30 AM", "Evento": "Retail Sales (Jan)", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 17, 2026", "Hora": "08:30 AM", "Evento": "Empire State Manufacturing Index", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 17, 2026", "Hora": "10:00 AM", "Evento": "Business Inventories", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 18, 2026", "Hora": "09:15 AM", "Evento": "Industrial Production", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 18, 2026", "Hora": "10:00 AM", "Evento": "Leading Indicators", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 18, 2026", "Hora": "02:00 PM", "Evento": "FOMC Minutes", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 19, 2026", "Hora": "08:30 AM", "Evento": "Trade Balance", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 19, 2026", "Hora": "08:30 AM", "Evento": "Philadelphia Fed Index", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 19, 2026", "Hora": "10:00 AM", "Evento": "Pending Home Sales", "Actual": "-", "Previsto": "-", "Anterior": "-", "Pais": "US"},
+    {"Fecha": "Feb 20, 2026", "Hora": "08:30 AM", "Evento": "GDP Advance Estimate (Q4)", "Actual": "-", "Previsto": "3.0%", "Anterior": "4.4%", "Pais": "US"},
+    {"Fecha": "Feb 20, 2026", "Hora": "08:30 AM", "Evento": "PCE Price Index (Inflation)", "Actual": "-", "Previsto": "0.3%", "Anterior": "0.2%", "Pais": "US"},
+    {"Fecha": "Feb 20, 2026", "Hora": "08:30 AM", "Evento": "Personal Income / Spending", "Actual": "-", "Previsto": "0.3%", "Anterior": "0.3%", "Pais": "US"}
+  ]
+}

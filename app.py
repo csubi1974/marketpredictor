@@ -1,5 +1,7 @@
 import pandas as pd
 import numpy as np
+import re
+import io
 from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier
 from xgboost import XGBClassifier
@@ -17,6 +19,7 @@ import requests
 import json
 import sqlite3
 from sqlite3 import Error
+from datetime import timezone as tz, timedelta as td, time as t_time
 from datetime import timezone as tz, timedelta as td, time as t_time
 try:
     from dotenv import load_dotenv
@@ -357,20 +360,86 @@ def get_llm_analysis(api_key, context_data):
         return f"Error de conexión: {str(e)}"
 
 def get_market_news(ticker):
-    """Obtiene los últimos titulares relevantes de Yahoo Finance."""
+    """Obtiene los últimos titulares con lógica de respaldo para índices."""
     try:
-        stock = yf.Ticker(ticker)
-        news = stock.news
-        headlines = []
-        if news:
-            for n in news[:5]: # Top 5 noticias
-                headlines.append(f"- {n['title']} ({n['publisher']})")
-        return "\n".join(headlines) if headlines else "No hay noticias recientes disponibles."
-    except Exception as e:
-        return "Error obteniendo noticias."
+        # Tickers de respaldo para noticias generales si el principal falla o es un índice
+        tickers_to_try = [ticker]
+        if ticker.startswith('^') or ticker == 'SPY':
+            tickers_to_try.extend(['SPY', 'QQQ', 'DIA'])
+        else:
+            tickers_to_try.append('SPY') # Siempre intentar SPY como backup
 
-def get_pre_market_briefing(api_key, context_data, news_text):
-    """Genera un informe pre-mercado combinando técnico + noticias."""
+        headlines = []
+        seen_titles = set()
+
+        for t in tickers_to_try:
+            if len(headlines) >= 8: break
+            try:
+                stock = yf.Ticker(t)
+                news = stock.news
+                if news:
+                    for n in news:
+                        title = n.get('title', '')
+                        if title and title not in seen_titles:
+                            headlines.append(f"- {title} ({n.get('publisher', 'Yahoo Finance')})")
+                            seen_titles.add(title)
+                        if len(headlines) >= 8: break
+            except:
+                continue
+                
+        return "\n".join(headlines) if headlines else "No se detectaron noticias urgentes en los canales de Yahoo Finance ahora mismo."
+    except Exception as e:
+        return f"Nota: Servicio de noticias temporalmente limitado. Enfoque en análisis técnico. ({str(e)})"
+
+@st.cache_data(ttl=1800)
+def get_economic_calendar():
+    """Obtiene el calendario híbrido: Blueprint para la semana + Scraper para datos reales."""
+    try:
+        # 1. Cargar Blueprint (Estructura de la semana)
+        blueprint_path = "macro_blueprint.json"
+        if os.path.exists(blueprint_path):
+            with open(blueprint_path, 'r') as f:
+                bp_data = json.load(f)
+            df = pd.DataFrame(bp_data['events'])
+        else:
+            # Fallback si no hay blueprint: usar scraper puro
+            df = pd.DataFrame(columns=['Fecha', 'Hora', 'Evento', 'Actual', 'Previsto', 'Anterior'])
+
+        # 2. Scrapear Yahoo para "Hoy" para rellenar los datos de "Actual"
+        try:
+            today_str = get_ny_time().strftime("%Y-%m-%d")
+            url = f"https://finance.yahoo.com/calendar/economic?day={today_str}&region=US"
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                tables = pd.read_html(io.StringIO(response.text))
+                if tables:
+                    scrape_df = tables[0]
+                    scrape_df.columns = [str(c).replace('\xa0', ' ') for c in scrape_df.columns]
+                    
+                    # Actualizar valores en nuestro DF principal si coinciden los nombres de eventos
+                    for _, row in scrape_df.iterrows():
+                        event_name = str(row.get('Event', '')).split('*')[0].strip()
+                        actual_val = row.get('Actual', '-')
+                        # Buscar en nuestro DF (Búsqueda difusa o parcial)
+                        mask = df['Evento'].str.contains(event_name, case=False, na=False)
+                        if mask.any():
+                            df.loc[mask, 'Actual'] = str(actual_val)
+        except Exception as e:
+            print(f"Aviso Scraper: No se pudo actualizar datos reales ({e})")
+
+        # Limpiar y ordenar
+        df = df.replace('nan', '-').fillna('-')
+        cols_to_show = ['Fecha', 'Hora', 'Evento', 'Actual', 'Previsto', 'Anterior']
+        existing_cols = [c for c in cols_to_show if c in df.columns]
+        return df[existing_cols]
+
+    except Exception as e:
+        return pd.DataFrame({"Error": [f"Error en calendario híbrido: {str(e)}"]})
+
+def get_pre_market_briefing(api_key, context_data, news_text, calendar_text=""):
+    """Genera un informe pre-mercado combinando técnico + noticias + macro."""
     if not api_key: return "⚠️ Error: Falta API Key de Groq."
     
     headers = {
@@ -387,12 +456,15 @@ def get_pre_market_briefing(api_key, context_data, news_text):
     - Muros Clave: Call {context_data.get('call_wall', 'N/A')} / Put {context_data.get('put_wall', 'N/A')}
     - VIX/Riesgo: {context_data.get('risk', 'N/A')}
     
-    2. ÚLTIMAS NOTICIAS (Fundamental):
+    2. ÚLTIMAS NOTICIAS:
     {news_text}
     
-    TU INFORME (Estilo Bloomberg/Profesional, Max 200 palabras):
+    3. CALENDARIO ECONÓMICO (Macro):
+    {calendar_text}
+    
+    TU INFORME (Estilo Bloomberg, Max 200 palabras):
     - TITULAR DE IMPACTO: Resumen de una línea.
-    - NARRATIVA: ¿Qué está moviendo el mercado hoy? (Cruza las noticias con el técnico).
+    - NARRATIVA: ¿Qué está moviendo el mercado hoy? (Cruza noticias, calendario y técnico).
     - ZONAS DE VIGILANCIA: Niveles de precio clave para hoy.
     - SENTENCIA: ¿Bullish, Bearish o Neutral?
     """
@@ -1278,8 +1350,8 @@ def main():
     model = load_model(ticker)
 
     # --- ESTRUCTURA DE PANTALLA: TORRE DE CONTROL ---
-    tab_market, tab_stats, tab_brain, tab_history = st.tabs([
-        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "📜 Historial"
+    tab_market, tab_stats, tab_brain, tab_calendar, tab_history = st.tabs([
+        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "📅 Agenda Económica", "📜 Historial"
     ])
 
     with tab_market:
@@ -1452,6 +1524,31 @@ def main():
         else:
             st.info("No hay un modelo activo. Usa el sidebar para entrenar uno nuevo.")
 
+    with tab_calendar:
+        st.subheader("📅 Calendario Económico Semanal (EE.UU.)")
+        st.info("💡 Resaltado en verde los eventos de HOY. Los datos pasados ayudan a entender el contexto de la semana.")
+        
+        cal_df = get_economic_calendar()
+        
+        if "Error" in cal_df.columns:
+            st.error(cal_df["Error"].iloc[0])
+        elif "Info" in cal_df.columns:
+            st.warning(cal_df["Info"].iloc[0])
+        else:
+            # Resaltar filas de hoy
+            today_str = get_ny_time().strftime("%b %d, %Y")
+            
+            def highlight_today(row):
+                return ['background-color: rgba(40, 167, 69, 0.3)' if row['Fecha'] == today_str else '' for _ in row]
+
+            st.dataframe(cal_df.style.apply(highlight_today, axis=1), use_container_width=True, hide_index=True)
+            
+            # IA Context: Solo le enviamos hoy y futuro cercano
+            summary_cal = []
+            for _, row in cal_df.head(15).iterrows():
+                summary_cal.append(f"- {row.get('Fecha', '')} {row.get('Hora', '')} | {row.get('Evento', 'N/D')} | Act: {row.get('Actual', '-')} Prev: {row.get('Previsto', '-')}")
+            st.session_state['calendar_text'] = "\n".join(summary_cal)
+
     with tab_market:
         st.sidebar.markdown("---")
         if st.sidebar.button('🚆 Entrenar / Sincronizar Modelo'):
@@ -1577,7 +1674,8 @@ def main():
                     if btn_briefing:
                         with st.spinner("Leyendo noticias y cruzando datos..."):
                             news = get_market_news(ticker)
-                            briefing = get_pre_market_briefing(groq_api_key, ctx, news)
+                            cal_txt = st.session_state.get('calendar_text', "Sin eventos macro reportados.")
+                            briefing = get_pre_market_briefing(groq_api_key, ctx, news, cal_txt)
                             st.success("### 🌅 Briefing Pre-Mercado (Macro + Técnico)")
                             st.markdown(briefing)
                             st.markdown("---")
