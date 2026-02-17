@@ -175,31 +175,50 @@ def calculate_crash_risk(df):
 
 # Función para calcular Momentum Intradía (Sniper Entry)
 def get_intraday_momentum(ticker):
-    """Descarga datos de 5m y calcula el momentum actual."""
+    """Descarga datos de 5m y calcula el momentum actual incluyendo Pre-market."""
     try:
-        data_5m = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
-        if data_5m.empty: return None
+        t_obj = yf.Ticker(ticker)
+        # Pedimos 5 días para asegurar que saltamos el feriado de ayer (Presidents' Day)
+        # include_prepost es crucial para ver el pre-market de hoy martes
+        # auto_adjust=False para que el precio coincida con el nominal de la web (sin descontar dividendos)
+        data_5m = t_obj.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
         
-        # Si las columnas son MultiIndex, las aplanamos
+        if data_5m.empty:
+            return None
+        
+        # Aplanar columnas
         if isinstance(data_5m.columns, pd.MultiIndex):
             data_5m.columns = data_5m.columns.get_level_values(0)
 
         # 0. Descargar VIX Intradía (Latido del Miedo)
-        vix_5m = yf.download("^VIX", period="2d", interval="5m", progress=False, auto_adjust=True)
-        if isinstance(vix_5m.columns, pd.MultiIndex): vix_5m.columns = vix_5m.columns.get_level_values(0)
+        try:
+            v_obj = yf.Ticker("^VIX")
+            vix_5m = v_obj.history(period="2d", interval="5m", prepost=True)
+            if isinstance(vix_5m.columns, pd.MultiIndex): vix_5m.columns = vix_5m.columns.get_level_values(0)
+        except:
+            vix_5m = pd.DataFrame()
 
-        # 1. Calcular VWAP (Aproximado para el día actual)
-        # Tomamos solo los datos de hoy (última sesión)
-        last_session = data_5m.index[-1].date()
-        today_data = data_5m[data_5m.index.date == last_session].copy()
+        # 1. Identificar la sesión más reciente disponible (Hoy martes o el último pre-market activo)
+        latest_date = data_5m.index[-1].date()
+        today_data = data_5m[data_5m.index.date == latest_date].copy()
         
-        if len(today_data) > 0:
-            v_p = today_data['Close'] * today_data['Volume']
-            today_data['VWAP'] = v_p.cumsum() / today_data['Volume'].cumsum()
-        else:
+        if today_data.empty: 
             return None
 
-        # 2. EMA 20
+        # 1.5 Obtener Cierre Anterior para referencia (Gap analysis)
+        try:
+            prev_sessions = data_5m[data_5m.index.date < latest_date]
+            prev_close = prev_sessions['Close'].iloc[-1] if not prev_sessions.empty else today_open
+        except:
+            prev_close = today_open
+
+        # 2. Calcular VWAP (Manejar volumen cero del pre-market)
+        v_p = today_data['Close'] * today_data['Volume']
+        cum_vol = today_data['Volume'].cumsum()
+        # Si no hay volumen (pre-market inicial), el VWAP es igual al Precio
+        today_data['VWAP'] = (v_p.cumsum() / cum_vol).fillna(today_data['Close'])
+
+        # 3. EMA 20
         today_data['EMA20'] = today_data['Close'].ewm(span=20, adjust=False).mean()
         
         last_price = today_data['Close'].iloc[-1]
@@ -207,57 +226,32 @@ def get_intraday_momentum(ticker):
         last_ema = today_data['EMA20'].iloc[-1]
         today_open = today_data['Open'].iloc[0]
         
-        # --- VALIDADOR DE TENDENCIA (TREND METER) ---
+        # --- VALIDADOR DE TENDENCIA ---
         score = 0
         if last_price > today_open: score += 1
         if last_price > last_vwap: score += 1
         if last_price > last_ema: score += 1
         
-        # Puntuación inversa para bajistas
         bear_score = 0
         if last_price < today_open: bear_score += 1
         if last_price < last_vwap: bear_score += 1
         if last_price < last_ema: bear_score += 1
 
-        # Determinar Estado Principal
-        if score == 3:
-            status = "CONFIRMED BULLISH (Tendencia Fuerte)"
-            color = "#28a745"
-            icon = "🚀"
-        elif bear_score == 3:
-            status = "CONFIRMED BEARISH (Presión Total)"
-            color = "#dc3545"
-            icon = "📉"
-        elif score >= 2:
-            status = "MODERATE BULLISH (Alerta de Compra)"
-            color = "#4ade80"
-            icon = "📈"
-        elif bear_score >= 2:
-            status = "MODERATE BEARISH (Alerta de Venta)"
-            color = "#f87171"
-            icon = "📉"
-        else:
-            status = "SIDEWAYS (Rango / Sin Rumbo)"
-            color = "#94a3b8"
-            icon = "⏳"
+        # Configuración visual
+        if score == 3: status, color, icon = ("CONFIRMED BULLISH", "#28a745", "🚀")
+        elif bear_score == 3: status, color, icon = ("CONFIRMED BEARISH", "#dc3545", "📉")
+        elif score >= 2: status, color, icon = ("MODERATE BULLISH", "#4ade80", "�")
+        elif bear_score >= 2: status, color, icon = ("MODERATE BEARISH", "#f87171", "📉")
+        else: status, color, icon = ("SIDEWAYS (Rango)", "#94a3b8", "⏳")
             
         return {
-            'price': last_price,
-            'vwap': last_vwap,
-            'ema': last_ema,
-            'open': today_open,
-            'status': status,
-            'color': color,
-            'icon': icon,
-            'score': score,
-            'bear_score': bear_score,
+            'price': last_price, 'vwap': last_vwap, 'ema': last_ema, 'open': today_open, 'prev_close': prev_close,
+            'status': status, 'color': color, 'icon': icon, 'score': score, 'bear_score': bear_score,
             'force': (max(score, bear_score) / 3) * 100,
-            'direction': "ALL UP" if score == 3 else "ALL DOWN" if bear_score == 3 else "MIXED",
-            'data': today_data,
-            'vix_data': vix_5m if not vix_5m.empty else None
+            'data': today_data, 'vix_data': vix_5m if not vix_5m.empty else None
         }
     except Exception as e:
-        print(f"Error en Intraday Monitor: {e}")
+        print(f"DEBUG Error Sniper: {e}")
         return None
 
 def get_options_sentiment(ticker):
@@ -1193,6 +1187,12 @@ def load_model(ticker):
 
 # Función principal de la app Streamlit
 def main():
+    st.set_page_config(
+        page_title="Market Predictor | AI Control Tower",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
     st.title('Predicción del Mercado de Valores')
 
     # Información inicial
@@ -1594,8 +1594,13 @@ def main():
                     <div style="padding:15px; border-radius:10px; background:{snip['color']}; color:white; text-align:center; border: 2px solid white;">
                         <h1 style="margin:0;">{snip['icon']}</h1>
                         <p style="margin:5px 0; font-weight:bold;">{snip['status']}</p>
-                        <p style="margin:0; font-size:0.8em;">Precio: ${snip['price']:.2f}<br>Apertura: ${snip['open']:.2f}<br>VWAP: ${snip['vwap']:.2f}</p>
-                        <p style="margin:5px 0 0 0; font-size:0.7em; color:#ddd;">Actualizado: {dt.now().strftime('%H:%M:%S')}</p>
+                        <p style="margin:0; font-size:0.8em;">
+                            <b>Precio (Live):</b> ${snip['price']:.2f}<br>
+                            <b>Cierre Anterior:</b> ${snip['prev_close']:.2f}<br>
+                            <b>Apertura (4am):</b> ${snip['open']:.2f}<br>
+                            <b>VWAP:</b> ${snip['vwap']:.2f}
+                        </p>
+                        <p style="margin:5px 0 0 0; font-size:0.7em; color:#ddd;">Actualizado (NY): {get_ny_time().strftime('%H:%M:%S')}</p>
                     </div>
                     """, unsafe_allow_html=True)
                     
