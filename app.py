@@ -438,6 +438,208 @@ def get_economic_calendar():
     except Exception as e:
         return pd.DataFrame({"Error": [f"Error en calendario híbrido: {str(e)}"]})
 
+# --- MOMENTUM SCANNER ---
+SCANNER_UNIVERSE = [
+    'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'BRK-B', 'AVGO', 'JPM',
+    'LLY', 'V', 'UNH', 'MA', 'XOM', 'COST', 'HD', 'PG', 'JNJ', 'ABBV',
+    'WMT', 'NFLX', 'CRM', 'BAC', 'ORCL', 'CVX', 'KO', 'MRK', 'AMD', 'PEP',
+    'TMO', 'CSCO', 'ACN', 'LIN', 'ADBE', 'MCD', 'ABT', 'WFC', 'DHR', 'PM',
+    'NOW', 'TXN', 'QCOM', 'INTU', 'ISRG', 'CAT', 'IBM', 'GE', 'AMAT', 'AMGN',
+    'VZ', 'BKNG', 'AXP', 'MS', 'GS', 'SPGI', 'BLK', 'PFE', 'T', 'LOW',
+    'NEE', 'UNP', 'RTX', 'HON', 'SYK', 'DE', 'BA', 'LMT', 'SBUX', 'MMM',
+    'GILD', 'MDLZ', 'ADI', 'LRCX', 'KLAC', 'PANW', 'SNPS', 'CDNS', 'MRVL', 'CRWD',
+    'PLTR', 'COIN', 'SQ', 'SHOP', 'SNOW', 'DKNG', 'MELI', 'MU', 'INTC', 'PYPL',
+    'ABNB', 'ARM', 'SMCI', 'DASH', 'UBER', 'NET', 'ZS', 'RBLX', 'ENPH', 'RIVN'
+]
+
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_momentum_stocks(price_min, price_max, min_volume):
+    """Escanea el universo de acciones buscando momentum alcista."""
+    results = []
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    total = len(SCANNER_UNIVERSE)
+    
+    for i, ticker in enumerate(SCANNER_UNIVERSE):
+        progress_bar.progress((i + 1) / total)
+        progress_text.caption(f"Escaneando {ticker}... ({i+1}/{total})")
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period='3mo', interval='1d', auto_adjust=True)
+            if hist.empty or len(hist) < 20:
+                continue
+            
+            price = hist['Close'].iloc[-1]
+            # Filtro de precio
+            if price < price_min or price > price_max:
+                continue
+            
+            # Filtro de volumen
+            avg_vol = hist['Volume'].tail(20).mean()
+            if avg_vol < min_volume:
+                continue
+            
+            # Calcular indicadores técnicos
+            ema_20 = hist['Close'].ewm(span=20).mean().iloc[-1]
+            ema_50 = hist['Close'].ewm(span=50).mean().iloc[-1]
+            
+            # RSI
+            delta = hist['Close'].diff()
+            gain = delta.where(delta > 0, 0).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss.replace(0, np.nan)
+            rsi = (100 - (100 / (1 + rs))).iloc[-1]
+            
+            # Cambios porcentuales
+            chg_1d = ((price / hist['Close'].iloc[-2]) - 1) * 100 if len(hist) > 1 else 0
+            chg_5d = ((price / hist['Close'].iloc[-6]) - 1) * 100 if len(hist) > 5 else 0
+            chg_20d = ((price / hist['Close'].iloc[-21]) - 1) * 100 if len(hist) > 20 else 0
+            
+            # Volumen relativo (hoy vs promedio)
+            vol_today = hist['Volume'].iloc[-1]
+            vol_ratio = vol_today / avg_vol if avg_vol > 0 else 0
+            
+            # Momentum Score (0-100)
+            score = 0
+            # Precio > EMA 20 (+20)
+            if price > ema_20: score += 20
+            # EMA 20 > EMA 50 (+20)
+            if ema_20 > ema_50: score += 20
+            # RSI entre 50-70 (+20) o >70 (+10)
+            if 50 <= rsi <= 70: score += 20
+            elif rsi > 70: score += 10
+            # Cambio 5d positivo (+20)
+            if chg_5d > 0: score += 20
+            # Volumen superior al promedio (+20)
+            if vol_ratio > 1.0: score += 20
+            
+            # Solo incluir si tiene mínimo 40 de score
+            if score >= 40:
+                results.append({
+                    'Ticker': ticker,
+                    'Precio': round(price, 2),
+                    '1D%': round(chg_1d, 2),
+                    '5D%': round(chg_5d, 2),
+                    '20D%': round(chg_20d, 2),
+                    'RSI': round(rsi, 1),
+                    'Vol Ratio': round(vol_ratio, 2),
+                    'Vol Avg': f"{avg_vol/1e6:.1f}M",
+                    'Score': score
+                })
+        except Exception:
+            continue
+    
+    progress_bar.empty()
+    progress_text.empty()
+    
+    if results:
+        df = pd.DataFrame(results).sort_values('Score', ascending=False).reset_index(drop=True)
+        return df
+    return pd.DataFrame()
+
+def get_stock_fundamentals(ticker):
+    """Obtiene datos fundamentales de una acción vía yfinance."""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        
+        # 52-week high distance
+        price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+        high_52 = info.get('fiftyTwoWeekHigh', 0)
+        dist_52 = ((price / high_52) - 1) * 100 if high_52 > 0 else 0
+        
+        return {
+            'Sector': info.get('sector', 'N/D'),
+            'Industry': info.get('industry', 'N/D'),
+            'Market Cap': info.get('marketCap', 0),
+            'P/E Ratio': info.get('trailingPE', info.get('forwardPE', 'N/D')),
+            'Revenue Growth': info.get('revenueGrowth', 'N/D'),
+            'Profit Margin': info.get('profitMargins', 'N/D'),
+            'Beta': info.get('beta', 'N/D'),
+            'EPS': info.get('trailingEps', 'N/D'),
+            '52W High Dist': round(dist_52, 1),
+            'Div Yield': info.get('dividendYield', 0),
+            'Short Name': info.get('shortName', ticker)
+        }
+    except Exception as e:
+        return {'Error': str(e)}
+
+def ai_stock_analysis(api_key, ticker, tech_data, fundamentals, fib_levels=None):
+    """Genera un análisis IA combinando técnicos y fundamentales."""
+    try:
+        # Formatear fundamentales
+        pe = fundamentals.get('P/E Ratio', 'N/D')
+        pe_str = f"{pe:.1f}x" if isinstance(pe, (int, float)) else str(pe)
+        
+        rev_g = fundamentals.get('Revenue Growth', 'N/D')
+        rev_str = f"{rev_g*100:.1f}%" if isinstance(rev_g, (int, float)) else str(rev_g)
+        
+        margin = fundamentals.get('Profit Margin', 'N/D')
+        margin_str = f"{margin*100:.1f}%" if isinstance(margin, (int, float)) else str(margin)
+        
+        beta = fundamentals.get('Beta', 'N/D')
+        beta_str = f"{beta:.2f}" if isinstance(beta, (int, float)) else str(beta)
+        
+        mcap = fundamentals.get('Market Cap', 0)
+        if mcap > 1e12: mcap_str = f"${mcap/1e12:.1f}T"
+        elif mcap > 1e9: mcap_str = f"${mcap/1e9:.1f}B"
+        else: mcap_str = f"${mcap/1e6:.0f}M"
+
+        prompt = f"""Eres un ANALISTA SENIOR de un Fondo de Cobertura. Analiza esta acción para una operación SWING (3-10 días).
+
+=== DATOS TÉCNICOS ===
+Ticker: {ticker}
+Precio: ${tech_data.get('Precio', 'N/D')}
+Cambio 1D: {tech_data.get('1D%', 0)}% | 5D: {tech_data.get('5D%', 0)}% | 20D: {tech_data.get('20D%', 0)}%
+RSI(14): {tech_data.get('RSI', 'N/D')}
+Vol Ratio (Hoy vs Avg): {tech_data.get('Vol Ratio', 'N/D')}x
+Momentum Score: {tech_data.get('Score', 0)}/100
+
+=== DATOS FUNDAMENTALES ===
+Sector: {fundamentals.get('Sector', 'N/D')} | {fundamentals.get('Industry', 'N/D')}
+Market Cap: {mcap_str}
+P/E Ratio: {pe_str}
+Revenue Growth: {rev_str}
+Profit Margin: {margin_str}
+Beta: {beta_str}
+Distancia al 52W High: {fundamentals.get('52W High Dist', 'N/D')}%"""
+        
+        # Agregar niveles Fibonacci si están disponibles
+        prompt += "\n\n=== FIBONACCI (3 meses) ==="
+        if fib_levels:
+            for name, price in fib_levels.items():
+                prompt += f"\n{name}: ${price:.2f}"
+        else:
+            prompt += "\nNo disponible"
+        
+        prompt += """
+
+TU ANÁLISIS (en español, Max 250 palabras):
+1. VEREDICTO: COMPRAR / ESPERAR / EVITAR
+2. JUSTIFICACIÓN TÉCNICA (2 líneas, menciona Fibonacci si aplica)
+3. JUSTIFICACIÓN FUNDAMENTAL (2 líneas)
+4. NIVELES CLAVE: Soporte y Resistencia basados en Fibonacci
+5. RIESGO: Bajo / Medio / Alto (y por qué)
+6. HORIZONTE: Cuánto tiempo mantener la posición"""
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 600
+        }
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", 
+                           headers=headers, json=payload, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()['choices'][0]['message']['content']
+        return "Error al consultar la IA. Intenta de nuevo."
+    except Exception as e:
+        return f"Error IA: {str(e)}"
+
 def get_pre_market_briefing(api_key, context_data, news_text, calendar_text=""):
     """Genera un informe pre-mercado combinando técnico + noticias + macro."""
     if not api_key: return "⚠️ Error: Falta API Key de Groq."
@@ -1350,8 +1552,8 @@ def main():
     model = load_model(ticker)
 
     # --- ESTRUCTURA DE PANTALLA: TORRE DE CONTROL ---
-    tab_market, tab_stats, tab_brain, tab_calendar, tab_history = st.tabs([
-        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "📅 Agenda Económica", "📜 Historial"
+    tab_market, tab_stats, tab_brain, tab_scanner, tab_calendar, tab_history = st.tabs([
+        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "🔬 Scanner", "📅 Agenda Económica", "📜 Historial"
     ])
 
     with tab_market:
@@ -1524,6 +1726,234 @@ def main():
         else:
             st.info("No hay un modelo activo. Usa el sidebar para entrenar uno nuevo.")
 
+    # --- MOMENTUM SCANNER TAB ---
+    with tab_scanner:
+        st.subheader("🔬 Momentum Scanner – Acciones con Impulso Alcista")
+        st.info("💡 Escanea ~100 acciones líquidas de EE.UU. buscando momentum alcista. Selecciona una para ver su gráfico y análisis IA.")
+        
+        # Filtros en columnas
+        filt_col1, filt_col2, filt_col3 = st.columns(3)
+        with filt_col1:
+            price_range = st.slider("💲 Rango de Precio ($)", min_value=5, max_value=2000, value=(20, 500), step=5)
+        with filt_col2:
+            vol_options = {'500K+': 500_000, '1M+': 1_000_000, '5M+': 5_000_000, '10M+': 10_000_000}
+            vol_label = st.selectbox("📊 Volumen Mínimo", list(vol_options.keys()), index=1)
+            min_vol = vol_options[vol_label]
+        with filt_col3:
+            force_filter = st.selectbox("⚡ Fuerza Mínima", ['Moderado (40+)', 'Fuerte (60+)', 'Explosivo (80+)'], index=0)
+            min_score = int(force_filter.split('(')[1].replace('+)', ''))
+        
+        if st.button("🚀 Iniciar Scanner", use_container_width=True, type="primary"):
+            scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol)
+            if not scan_df.empty:
+                scan_df = scan_df[scan_df['Score'] >= min_score].reset_index(drop=True)
+                st.session_state['scan_results'] = scan_df
+            else:
+                st.session_state['scan_results'] = pd.DataFrame()
+                st.warning("No se encontraron acciones que cumplan los criterios. Intenta ampliar los filtros.")
+        
+        # Mostrar resultados
+        if 'scan_results' in st.session_state and not st.session_state['scan_results'].empty:
+            scan_df = st.session_state['scan_results']
+            st.success(f"✅ {len(scan_df)} acciones encontradas con momentum alcista")
+            
+            # Colorear filas por Score
+            def color_score(val):
+                if val >= 80: return 'background-color: rgba(40, 167, 69, 0.4); font-weight: bold'
+                elif val >= 60: return 'background-color: rgba(255, 193, 7, 0.3)'
+                return ''
+            
+            def color_change(val):
+                try:
+                    v = float(val)
+                    if v > 0: return 'color: #28a745'
+                    elif v < 0: return 'color: #dc3545'
+                except: pass
+                return ''
+            
+            styled = scan_df.style.applymap(color_score, subset=['Score'])
+            styled = styled.applymap(color_change, subset=['1D%', '5D%', '20D%'])
+            st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+            
+            # Selección de acción para análisis profundo
+            st.markdown("---")
+            st.subheader("📈 Análisis Profundo")
+            
+            selected_ticker = st.selectbox(
+                "Selecciona una acción para análisis detallado:",
+                scan_df['Ticker'].tolist(),
+                key='scanner_select'
+            )
+            
+            if selected_ticker:
+                chart_col, info_col = st.columns([3, 2])
+                
+                with chart_col:
+                    # Gráfico Candlestick
+                    st.caption(f"📊 Gráfico de {selected_ticker} (3 meses)")
+                    try:
+                        tk = yf.Ticker(selected_ticker)
+                        chart_data = tk.history(period='3mo', interval='1d', auto_adjust=True)
+                        
+                        if not chart_data.empty:
+                            ema20 = chart_data['Close'].ewm(span=20).mean()
+                            ema50 = chart_data['Close'].ewm(span=50).mean()
+                            
+                            # Bollinger Bands
+                            std = chart_data['Close'].rolling(window=20).std()
+                            bb_upper = ema20 + (std * 2)
+                            bb_lower = ema20 - (std * 2)
+                            
+                            fig = go.Figure()
+                            # Velas
+                            fig.add_trace(go.Candlestick(
+                                x=chart_data.index,
+                                open=chart_data['Open'], high=chart_data['High'],
+                                low=chart_data['Low'], close=chart_data['Close'],
+                                name=selected_ticker
+                            ))
+                            # Indicadores
+                            fig.add_trace(go.Scatter(x=chart_data.index, y=ema20, name='EMA 20', line=dict(color='#00d4ff', width=1)))
+                            fig.add_trace(go.Scatter(x=chart_data.index, y=ema50, name='EMA 50', line=dict(color='#ff6b35', width=1)))
+                            fig.add_trace(go.Scatter(x=chart_data.index, y=bb_upper, name='BB Upper', line=dict(color='rgba(173,216,230,0.3)', width=1, dash='dot'), showlegend=False))
+                            fig.add_trace(go.Scatter(x=chart_data.index, y=bb_lower, name='BB Lower', line=dict(color='rgba(173,216,230,0.3)', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(173,216,230,0.05)', showlegend=False))
+                            
+                            # Volumen como subplot
+                            vol_colors = ['#28a745' if c >= o else '#dc3545' 
+                                         for c, o in zip(chart_data['Close'], chart_data['Open'])]
+                            fig.add_trace(go.Bar(x=chart_data.index, y=chart_data['Volume'],
+                                                name='Volumen', marker_color=vol_colors, opacity=0.2,
+                                                yaxis='y2'))
+                            
+                            # --- FIBONACCI RETRACEMENT (sutil) ---
+                            fib_high = chart_data['High'].max()
+                            fib_low = chart_data['Low'].min()
+                            fib_diff = fib_high - fib_low
+                            
+                            fib_levels = [
+                                ('23.6%', fib_high - 0.236 * fib_diff, 'rgba(255,107,107,0.5)'),
+                                ('38.2%', fib_high - 0.382 * fib_diff, 'rgba(255,169,77,0.5)'),
+                                ('50.0%', fib_high - 0.5 * fib_diff,   'rgba(255,212,59,0.6)'),
+                                ('61.8%', fib_high - 0.618 * fib_diff, 'rgba(105,219,124,0.6)'),
+                                ('78.6%', fib_high - 0.786 * fib_diff, 'rgba(56,217,169,0.5)'),
+                            ]
+                            
+                            for label, price, color in fib_levels:
+                                fig.add_hline(
+                                    y=price,
+                                    line_dash="dash",
+                                    line_color=color,
+                                    line_width=0.8,
+                                    annotation_text=f"{label}  ${price:.0f}",
+                                    annotation_position="right",
+                                    annotation_font=dict(size=8, color=color),
+                                    annotation_bgcolor="rgba(0,0,0,0.5)",
+                                )
+                            
+                            fig.update_layout(
+                                height=500,
+                                template='plotly_dark',
+                                paper_bgcolor='rgba(0,0,0,0)',
+                                plot_bgcolor='rgba(0,0,0,0)',
+                                xaxis_rangeslider_visible=False,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                                margin=dict(l=10, r=10, t=30, b=10),
+                                yaxis2=dict(overlaying='y', side='right', showgrid=False, showticklabels=False, range=[0, chart_data['Volume'].max()*4])
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Error al cargar gráfico: {e}")
+                
+                with info_col:
+                    # Fundamentales
+                    st.caption("📋 Datos Fundamentales")
+                    with st.spinner('Cargando fundamentales...'):
+                        fundies = get_stock_fundamentals(selected_ticker)
+                    
+                    if 'Error' not in fundies:
+                        st.markdown(f"**{fundies.get('Short Name', selected_ticker)}**")
+                        st.markdown(f"🏢 {fundies.get('Sector', 'N/D')} | {fundies.get('Industry', 'N/D')}")
+                        
+                        # Market Cap
+                        mcap = fundies.get('Market Cap', 0)
+                        if mcap > 1e12: mcap_s = f"${mcap/1e12:.1f}T"
+                        elif mcap > 1e9: mcap_s = f"${mcap/1e9:.1f}B"
+                        else: mcap_s = f"${mcap/1e6:.0f}M"
+                        
+                        fc1, fc2 = st.columns(2)
+                        with fc1:
+                            pe = fundies.get('P/E Ratio', 'N/D')
+                            pe_s = f"{pe:.1f}x" if isinstance(pe, (int, float)) else pe
+                            st.metric("P/E Ratio", pe_s)
+                            st.metric("Market Cap", mcap_s)
+                            beta = fundies.get('Beta', 'N/D')
+                            beta_s = f"{beta:.2f}" if isinstance(beta, (int, float)) else beta
+                            st.metric("Beta", beta_s)
+                        with fc2:
+                            rev = fundies.get('Revenue Growth', 'N/D')
+                            rev_s = f"{rev*100:.1f}%" if isinstance(rev, (int, float)) else rev
+                            st.metric("Rev. Growth", rev_s)
+                            mg = fundies.get('Profit Margin', 'N/D')
+                            mg_s = f"{mg*100:.1f}%" if isinstance(mg, (int, float)) else mg
+                            st.metric("Profit Margin", mg_s)
+                            st.metric("vs 52W High", f"{fundies.get('52W High Dist', 0)}%")
+                    else:
+                        st.warning("No se pudieron cargar los fundamentales.")
+                
+                # Análisis IA
+                st.markdown("---")
+                if groq_api_key:
+                    if st.button(f"🧠 Análisis IA de {selected_ticker}", use_container_width=True, type='primary'):
+                        with st.spinner('La IA está analizando...'):
+                            tech_row = scan_df[scan_df['Ticker'] == selected_ticker].iloc[0].to_dict()
+                            # Calcular Fibonacci para pasarle a la IA
+                            try:
+                                fib_hist = yf.Ticker(selected_ticker).history(period='3mo', interval='1d')
+                                fib_h = fib_hist['High'].max()
+                                fib_l = fib_hist['Low'].min()
+                                fib_d = fib_h - fib_l
+                                fib_data = {
+                                    '0% (Max)': fib_h,
+                                    '23.6%': fib_h - 0.236 * fib_d,
+                                    '38.2%': fib_h - 0.382 * fib_d,
+                                    '50%': fib_h - 0.5 * fib_d,
+                                    '61.8%': fib_h - 0.618 * fib_d,
+                                    '78.6%': fib_h - 0.786 * fib_d,
+                                    '100% (Min)': fib_l
+                                }
+                            except:
+                                fib_data = None
+                            
+                            if 'Error' not in fundies:
+                                analysis = ai_stock_analysis(groq_api_key, selected_ticker, tech_row, fundies, fib_data)
+                            else:
+                                analysis = ai_stock_analysis(groq_api_key, selected_ticker, tech_row, {}, fib_data)
+                        
+                        st.markdown(f"### 🧠 Veredicto IA: {selected_ticker}")
+                        
+                        # Extraer veredicto para estilo visual
+                        verdict = "ESP"
+                        v_color = "#ffc107" # Amarillo por defecto
+                        if "COMPRAR" in analysis.upper() or "🟢" in analysis:
+                            verdict = "COMPRA RECOMENDADA"
+                            v_color = "#28a745"
+                        elif "EVITAR" in analysis.upper() or "🔴" in analysis:
+                            verdict = "EVITAR / ALTO RIESGO"
+                            v_color = "#dc3545"
+                        elif "ESPERAR" in analysis.upper() or "🟡" in analysis:
+                            verdict = "MANTENER / OBSERVAR"
+                            v_color = "#ffc107"
+
+                        st.markdown(f"""
+                        <div style="background: rgba(0,0,0,0.3); border-left: 5px solid {v_color}; padding: 15px; border-radius: 10px; margin-bottom: 20px;">
+                            <h2 style="color:{v_color}; margin:0; font-size: 1.2em;">{verdict}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        st.markdown(analysis)
+                else:
+                    st.warning("Configura GROQ_API_KEY en .env para habilitar el análisis IA.")
+
     with tab_calendar:
         st.subheader("📅 Calendario Económico Semanal (EE.UU.)")
         st.info("💡 Resaltado en verde los eventos de HOY. Los datos pasados ayudan a entender el contexto de la semana.")
@@ -1543,7 +1973,7 @@ def main():
 
             st.dataframe(cal_df.style.apply(highlight_today, axis=1), use_container_width=True, hide_index=True)
             
-            # IA Context: Solo le enviamos hoy y futuro cercano
+            # IA Context
             summary_cal = []
             for _, row in cal_df.head(15).iterrows():
                 summary_cal.append(f"- {row.get('Fecha', '')} {row.get('Hora', '')} | {row.get('Evento', 'N/D')} | Act: {row.get('Actual', '-')} Prev: {row.get('Previsto', '-')}")
