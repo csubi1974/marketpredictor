@@ -449,11 +449,16 @@ SCANNER_UNIVERSE = [
     'NEE', 'UNP', 'RTX', 'HON', 'SYK', 'DE', 'BA', 'LMT', 'SBUX', 'MMM',
     'GILD', 'MDLZ', 'ADI', 'LRCX', 'KLAC', 'PANW', 'SNPS', 'CDNS', 'MRVL', 'CRWD',
     'PLTR', 'COIN', 'SQ', 'SHOP', 'SNOW', 'DKNG', 'MELI', 'MU', 'INTC', 'PYPL',
-    'ABNB', 'ARM', 'SMCI', 'DASH', 'UBER', 'NET', 'ZS', 'RBLX', 'ENPH', 'RIVN'
+    'ABNB', 'ARM', 'SMCI', 'DASH', 'UBER', 'NET', 'ZS', 'RBLX', 'ENPH', 'RIVN',
+    'SOFI', 'SNAP', 'HOOD', 'CLSK', 'MARA', 'RIOT', 'F', 'AAL', 'VALE', 'NIO',
+    'PARA', 'PINS', 'UPST', 'AFRM', 'AI', 'PLUG', 'RUN', 'BABA', 'JD', 'CPNG',
+    'GRAB', 'SE', 'NU', 'DLO', 'U', 'ROKU', 'GME', 'XPEV', 'LI', 'FUTU'
 ]
 
+
 @st.cache_data(ttl=900, show_spinner=False)
-def scan_momentum_stocks(price_min, price_max, min_volume):
+def scan_momentum_stocks(price_min, price_max, min_volume, smooth_momentum=False):
+
     """Escanea el universo de acciones buscando momentum alcista."""
     results = []
     progress_text = st.empty()
@@ -499,6 +504,10 @@ def scan_momentum_stocks(price_min, price_max, min_volume):
             vol_today = hist['Volume'].iloc[-1]
             vol_ratio = vol_today / avg_vol if avg_vol > 0 else 0
             
+            # Volatilidad (Desviación estándar de retornos diarios - 20 días)
+            daily_vol = hist['Close'].pct_change().tail(20).std()
+
+            
             # Momentum Score (0-100)
             score = 0
             # Precio > EMA 20 (+20)
@@ -512,6 +521,16 @@ def scan_momentum_stocks(price_min, price_max, min_volume):
             if chg_5d > 0: score += 20
             # Volumen superior al promedio (+20)
             if vol_ratio > 1.0: score += 20
+            
+            # --- FILTRO DE MOMENTUM SUAVE (Baja Volatilidad) ---
+            if smooth_momentum:
+                # Si la volatilidad diaria es baja (< 2%), premiamos la estabilidad
+                if daily_vol < 0.02: 
+                    score += 20
+                # Si es muy alta (> 4%), penalizamos fuertemente
+                elif daily_vol > 0.04:
+                    score -= 40
+
             
             # Solo incluir si tiene mínimo 40 de score
             if score >= 40:
@@ -1813,6 +1832,10 @@ def main():
             force_filter = st.selectbox("⚡ Fuerza Mínima", ['Moderado (40+)', 'Fuerte (60+)', 'Explosivo (80+)'], index=0)
             min_score = int(force_filter.split('(')[1].replace('+)', ''))
         
+        # Filtro de Volatilidad (Smooth Momentum)
+        smooth_check = st.checkbox("🧘 Filtrar por 'Momentum Suave' (Busca subidas constantes, evita saltos violentos)", value=False)
+
+        
         # --- CALCULADORA DE POSICIÓN (SIDEBAR) ---
         with st.sidebar.expander("🧮 Calculadora de Gestión de Riesgo", expanded=True):
             st.markdown("#### Planifica tu Trade")
@@ -1840,7 +1863,8 @@ def main():
                 st.error("El Stop Loss debe ser menor a la Entrada.")
         
         if st.button("🚀 Iniciar Escaneo de Mercado", use_container_width=True, type="primary"):
-            scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol)
+            scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol, smooth_check)
+
             if not scan_df.empty:
                 # Enriquecer con Sectores para el Heatmap (solo para los resultados)
                 with st.spinner('Mapeando sectores...'):
