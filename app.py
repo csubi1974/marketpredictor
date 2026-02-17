@@ -1787,6 +1787,32 @@ def main():
             force_filter = st.selectbox("⚡ Fuerza Mínima", ['Moderado (40+)', 'Fuerte (60+)', 'Explosivo (80+)'], index=0)
             min_score = int(force_filter.split('(')[1].replace('+)', ''))
         
+        # --- CALCULADORA DE POSICIÓN (SIDEBAR) ---
+        with st.sidebar.expander("🧮 Calculadora de Gestión de Riesgo", expanded=True):
+            st.markdown("#### Planifica tu Trade")
+            account_size = st.number_input("💰 Capital Total ($)", value=10000, step=1000)
+            risk_pct = st.slider("⚠️ Riesgo por Operación (%)", 0.5, 5.0, 1.0, 0.5)
+            
+            risk_amount = account_size * (risk_pct / 100)
+            st.info(f"Riesgo Máximo: **${risk_amount:.2f}**")
+            
+            calc_entry = st.number_input("Precio Entrada ($)", value=0.0, step=0.1)
+            calc_stop = st.number_input("Stop Loss ($)", value=0.0, step=0.1)
+            
+            if calc_entry > 0 and calc_stop > 0 and calc_entry > calc_stop:
+                risk_per_share = calc_entry - calc_stop
+                shares = int(risk_amount // risk_per_share)
+                position_value = shares * calc_entry
+                
+                st.markdown("---")
+                st.success(f"🎯 **Comprar: {shares} acciones**")
+                st.caption(f"Valor Posición: ${position_value:,.2f}")
+                
+                if position_value > account_size:
+                    st.warning("⚠️ ¡Cuidado! Esta posición usa margin (aplacamiento).")
+            elif calc_entry > 0 and calc_stop >= calc_entry:
+                st.error("El Stop Loss debe ser menor a la Entrada.")
+        
         if st.button("🚀 Iniciar Escaneo de Mercado", use_container_width=True, type="primary"):
             scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol)
             if not scan_df.empty:
@@ -1876,6 +1902,16 @@ def main():
             else:
                 # Si no hay columna Sector (resultados antiguos), mostrar advertencia
                 st.warning("⚠️ Ejecuta un nuevo escaneo para ver el análisis de sectores.")
+
+            # Botón de Descarga de Resultados
+            csv = df_res.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Descargar Resultados (CSV)",
+                data=csv,
+                file_name=f"momentum_scan_{dt.now().strftime('%Y-%m-%d')}.csv",
+                mime='text/csv',
+                use_container_width=True
+            )
 
             st.markdown("---")
             st.success(f"✅ {len(df_res)} acciones encontradas con momentum alcista")
