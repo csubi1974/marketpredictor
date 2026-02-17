@@ -1,6 +1,6 @@
 # Use an official lightweight Python image.
-# https://hub.docker.com/_/python
-FROM python:3.9-slim-buster
+# Using Bookworm (Debian 12) as Buster is EOL/Archived
+FROM python:3.11-slim-bookworm
 
 # Keeps Python from generating .pyc files in the container
 ENV PYTHONDONTWRITEBYTECODE=1
