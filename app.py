@@ -1517,7 +1517,6 @@ def main():
                         <h4 style="margin:0; color:{opt_data['color']};">{opt_data['sent']}</h4>
                         <span style="font-size:0.8em; color:#fff; background:{opt_data['color']}; padding:2px 8px; border-radius:10px;">P/C: {opt_data['ratio']:.2f}</span>
                     </div>
-                    
                     <div style="margin-top:10px; padding:10px; background:rgba(255,255,255,0.05); border-radius:5px;">
                         <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
                             <span style="color:#ff6b6b; font-weight:bold;">🧱 Call Wall (Resistencia):</span>
@@ -1528,7 +1527,6 @@ def main():
                             <span style="color:white;">${opt_data['put_wall']:,.0f}</span>
                         </div>
                     </div>
-
                     <div style="display:flex; justify-content:space-between; font-size:0.75em; margin-top:8px; color:#999;">
                         <span>Vol. Calls: {int(opt_data['vol_calls']):,}</span>
                         <span>Vol. Puts: {int(opt_data['vol_puts']):,}</span>
