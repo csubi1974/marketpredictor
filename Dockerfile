@@ -29,8 +29,8 @@ COPY . .
 # Expose the port that Streamlit runs on (default is 8501)
 EXPOSE 8501
 
-# The healthcheck ensures the container stays healthy
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
+# Removed manual HEALTHCHECK to let EasyPanel handle it or assume healthy once port is open.
+# This avoids timeouts during initial heavy installation or startup.
 
 # Run the Streamlit app on container start
 ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
