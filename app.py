@@ -691,7 +691,8 @@ def get_pre_market_briefing(api_key, context_data, news_text, calendar_text=""):
 # --- SISTEMA DE BASE DE DATOS SQLITE ---
 class MarketDB:
     def __init__(self, db_file="market_data.db"):
-        self.db_file = db_file
+        # Usar ruta absoluta para evitar ambigüedades
+        self.db_file = os.path.abspath(db_file)
         self.init_db()
 
     def init_db(self):
@@ -820,19 +821,36 @@ class MarketDB:
         return df
 
     def save_journal_entry(self, ticker, price, score, verdict, reasoning):
+        conn = None
         try:
             conn = sqlite3.connect(self.db_file)
             now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
-            conn.execute('''
-                INSERT INTO journal (ticker, entry_date, entry_price, score, verdict, reasoning)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (ticker, now, float(price), int(score), verdict, reasoning))
+            
+            # --- CONVERSIÓN ESTRICTA DE TIPOS ---
+            # SQLite no se lleva bien con numpy types
+            t_val = str(ticker)
+            d_val = str(now)
+            p_val = float(price)
+            s_val = int(score)
+            v_val = str(verdict)
+            r_val = str(reasoning)
+            
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO journal (ticker, entry_date, entry_price, score, verdict, reasoning, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'OPEN')
+            ''', (t_val, d_val, p_val, s_val, v_val, r_val))
+            
             conn.commit()
-            conn.close()
             return True
         except Exception as e:
-            print(f"Error saving journal: {e}")
+            print(f"CRITICAL ERROR SAVING JOURNAL: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+        finally:
+            if conn:
+                conn.close()
 
     def get_journal_entries(self):
         conn = sqlite3.connect(self.db_file)
@@ -1930,8 +1948,8 @@ def main():
                 except: pass
                 return ''
             
-            styled = scan_df.style.applymap(color_score, subset=['Score'])
-            styled = styled.applymap(color_change, subset=['1D%', '5D%', '20D%'])
+            styled = scan_df.style.map(color_score, subset=['Score'])
+            styled = styled.map(color_change, subset=['1D%', '5D%', '20D%'])
             st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
             
             # Selección de acción para análisis profundo
@@ -2111,20 +2129,31 @@ def main():
                         
                         st.markdown(analysis)
                         
-                        # --- BOTÓN PARA GUARDAR EN DIARIO ---
-                        if st.button("💾 Guardar en mi Diario de Operaciones", use_container_width=True):
-                            # Preparar datos
-                            save_ok = market_db.save_journal_entry(
-                                ticker=selected_ticker,
-                                price=tech_row.get('Precio', 0),
-                                score=tech_row.get('Score', 0),
-                                verdict=verdict,
-                                reasoning=analysis[:500] + "..." # Truncar para la DB
-                            )
-                            if save_ok:
-                                st.success(f"✅ ¡{selected_ticker} guardado en tu Bitácora!")
+                        # --- LÓGICA DE GUARDADO CON CALLBACK ---
+                        def save_trade_callback(t, p, s, v, r):
+                            success = market_db.save_journal_entry(t, p, s, v, r)
+                            if success:
+                                st.session_state['save_success'] = f"✅ ¡{t} guardado con éxito!"
+                                #st.balloons() # Reservado para ejecución directa
                             else:
-                                st.error("❌ Error al guardar en la base de datos.")
+                                st.session_state['save_error'] = "❌ Error al guardar en base de datos."
+
+                        st.write("---")
+                        
+                        # Mostrar mensajes de estado de guardados anteriores
+                        if 'save_success' in st.session_state:
+                            st.success(st.session_state.pop('save_success'))
+                            st.balloons()
+                        if 'save_error' in st.session_state:
+                            st.error(st.session_state.pop('save_error'))
+
+                        st.button(
+                            "💾 Guardar en mi Diario de Operaciones", 
+                            key=f"save_btn_{selected_ticker}", 
+                            use_container_width=True,
+                            on_click=save_trade_callback,
+                            args=(selected_ticker, tech_row.get('Precio', 0), tech_row.get('Score', 0), verdict, analysis[:500])
+                        )
                 else:
                     st.warning("Configura GROQ_API_KEY en .env para habilitar el análisis IA.")
 
@@ -2363,37 +2392,55 @@ def main():
         hist_sel = st.radio("Ver registros de:", ["📅 Diario de Operaciones (Scanner)", "🤖 Bitácora de Predicciones AI"], horizontal=True)
         
         if hist_sel == "📅 Diario de Operaciones (Scanner)":
-            st.markdown("#### 🗒️ Operaciones Guardadas del Scanner")
-            journal_data = market_db.get_journal_entries()
+            st.markdown("#### 🗒️ Operaciones Guardadas (SQLite Local)")
+            
+            # Botón para forzar actualización de precios (evita lentitud al cargar)
+            refresh_prices = st.button("🔄 Actualizar Precios Actuales")
+            
+            try:
+                journal_data = market_db.get_journal_entries()
+            except Exception as e:
+                st.error(f"Error al leer la base de datos: {e}")
+                journal_data = pd.DataFrame()
             
             if not journal_data.empty:
                 for idx, row in journal_data.iterrows():
-                    with st.expander(f"📌 {row['ticker']} - {row['entry_date']} ({row['verdict']})"):
+                    with st.expander(f"📌 {row['ticker']} | {row['entry_date']} | {row['verdict']}"):
                         jcol1, jcol2, jcol3 = st.columns([1, 1, 1])
                         
-                        # Intentar obtener precio actual
-                        try:
-                            cur_p = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
-                            perf = ((cur_p / row['entry_price']) - 1) * 100
-                            p_color = "#28a745" if perf >= 0 else "#dc3545"
-                        except:
-                            cur_p = "N/D"
-                            perf = 0
-                            p_color = "#bbb"
-
+                        cur_p = "N/D (Refresh)"
+                        perf = 0
+                        p_color = "#bbb"
+                        
+                        # Solo actualizar precios si el usuario lo pide
+                        if refresh_prices:
+                            try:
+                                cur_p_val = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
+                                cur_p = cur_p_val
+                                perf = ((cur_p / row['entry_price']) - 1) * 100
+                                p_color = "#28a745" if perf >= 0 else "#dc3545"
+                            except:
+                                cur_p = "Error Conexión"
+                        
                         jcol1.metric("Precio Entrada", f"${row['entry_price']:.2f}")
-                        jcol2.metric("Precio Actual", f"${cur_p:.2f}" if isinstance(cur_p, float) else cur_p, delta=f"{perf:.2f}%" if isinstance(cur_p, float) else None)
+                        
+                        if isinstance(cur_p, (int, float)):
+                            jcol2.metric("Precio Actual", f"${cur_p:.2f}", delta=f"{perf:.2f}%")
+                        else:
+                            jcol2.metric("Precio Actual", str(cur_p))
+                            
                         jcol3.metric("Score Original", f"{row['score']}/100")
                         
                         st.markdown("**🧠 Razonamiento IA:**")
                         st.caption(row['reasoning'])
                         
-                        if st.button(f"🗑️ Eliminar Registro {row['id']}", key=f"del_{row['id']}"):
+                        if st.button(f"🗑️ Cerrar/Eliminar Trade {row['id']}", key=f"del_{row['id']}"):
                             if market_db.delete_journal_entry(row['id']):
-                                st.success("Registro eliminado.")
+                                st.success("Trade cerrado y eliminado del diario.")
+                                time.sleep(1)
                                 st.rerun()
             else:
-                st.info("Aún no tienes operaciones guardadas. ¡Usa el Scanner para encontrar oportunidades!")
+                st.info("Tu bitácora está vacía. Guarda operaciones desde el Scanner.")
         
         else:
             st.markdown(f"#### 🤖 Registro de Predicciones: {ticker}")
