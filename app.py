@@ -723,6 +723,18 @@ class MarketDB:
                     is_backtest INTEGER
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT,
+                    entry_date TEXT,
+                    entry_price REAL,
+                    score INTEGER,
+                    verdict TEXT,
+                    reasoning TEXT,
+                    status TEXT DEFAULT 'OPEN'
+                )
+            ''')
             conn.commit()
             conn.close()
         except Error as e:
@@ -806,6 +818,38 @@ class MarketDB:
         df = pd.read_sql_query(query, conn)
         conn.close()
         return df
+
+    def save_journal_entry(self, ticker, price, score, verdict, reasoning):
+        try:
+            conn = sqlite3.connect(self.db_file)
+            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            conn.execute('''
+                INSERT INTO journal (ticker, entry_date, entry_price, score, verdict, reasoning)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (ticker, now, float(price), int(score), verdict, reasoning))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error saving journal: {e}")
+            return False
+
+    def get_journal_entries(self):
+        conn = sqlite3.connect(self.db_file)
+        query = "SELECT * FROM journal ORDER BY id DESC"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+
+    def delete_journal_entry(self, entry_id):
+        try:
+            conn = sqlite3.connect(self.db_file)
+            conn.execute("DELETE FROM journal WHERE id = ?", (entry_id,))
+            conn.commit()
+            conn.close()
+            return True
+        except:
+            return False
 
 market_db = MarketDB()
 
@@ -1728,13 +1772,13 @@ def main():
 
     # --- MOMENTUM SCANNER TAB ---
     with tab_scanner:
-        st.subheader("🔬 Momentum Scanner – Acciones con Impulso Alcista")
-        st.info("💡 Escanea ~100 acciones líquidas de EE.UU. buscando momentum alcista. Selecciona una para ver su gráfico y análisis IA.")
+        st.subheader("🔬 Momentum Scanner & Rotación de Sectores")
+        st.info("💡 Análisis de flujo de capital. Identifica qué sectores lideran el mercado antes de elegir una acción.")
         
         # Filtros en columnas
         filt_col1, filt_col2, filt_col3 = st.columns(3)
         with filt_col1:
-            price_range = st.slider("💲 Rango de Precio ($)", min_value=5, max_value=2000, value=(20, 500), step=5)
+            price_range = st.slider("💲 Rango de Precio ($)", min_value=5, max_value=2000, value=(10, 800), step=5)
         with filt_col2:
             vol_options = {'500K+': 500_000, '1M+': 1_000_000, '5M+': 5_000_000, '10M+': 10_000_000}
             vol_label = st.selectbox("📊 Volumen Mínimo", list(vol_options.keys()), index=1)
@@ -1743,19 +1787,98 @@ def main():
             force_filter = st.selectbox("⚡ Fuerza Mínima", ['Moderado (40+)', 'Fuerte (60+)', 'Explosivo (80+)'], index=0)
             min_score = int(force_filter.split('(')[1].replace('+)', ''))
         
-        if st.button("🚀 Iniciar Scanner", use_container_width=True, type="primary"):
+        if st.button("🚀 Iniciar Escaneo de Mercado", use_container_width=True, type="primary"):
             scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol)
             if not scan_df.empty:
+                # Enriquecer con Sectores para el Heatmap (solo para los resultados)
+                with st.spinner('Mapeando sectores...'):
+                    sectors = []
+                    for t in scan_df['Ticker']:
+                        try:
+                            # Cachear el sector para no saturar API
+                            s_info = yf.Ticker(t).info.get('sector', 'Otros')
+                            sectors.append(s_info)
+                        except:
+                            sectors.append('N/D')
+                    scan_df['Sector'] = sectors
+                
                 scan_df = scan_df[scan_df['Score'] >= min_score].reset_index(drop=True)
                 st.session_state['scan_results'] = scan_df
             else:
                 st.session_state['scan_results'] = pd.DataFrame()
-                st.warning("No se encontraron acciones que cumplan los criterios. Intenta ampliar los filtros.")
+                st.warning("No se encontraron acciones. Intenta ampliar los filtros.")
         
-        # Mostrar resultados
+        # --- NUEVA SECCIÓN: DASHBOARD DE SECTORES ---
         if 'scan_results' in st.session_state and not st.session_state['scan_results'].empty:
-            scan_df = st.session_state['scan_results']
-            st.success(f"✅ {len(scan_df)} acciones encontradas con momentum alcista")
+            df_res = st.session_state['scan_results']
+            scan_df = df_res  # Asignar para uso posterior
+            
+            st.markdown("---")
+            
+            # Verificar si existe la columna 'Sector' antes de mostrar el dashboard
+            if 'Sector' in df_res.columns:
+                dash_col1, dash_col2 = st.columns([2, 1])
+                
+                with dash_col1:
+                    st.markdown("#### 🔥 Mapa de Calor por Sectores (Score Promedio)")
+                    sector_stats = df_res.groupby('Sector')['Score'].mean().sort_values(ascending=False)
+                    
+                    fig_heat = go.Figure(go.Bar(
+                        x=sector_stats.values,
+                        y=sector_stats.index,
+                        orientation='h',
+                        marker=dict(
+                            color=sector_stats.values,
+                            colorscale='Viridis',
+                            showscale=False
+                        ),
+                        text=[f"{v:.1f}" for v in sector_stats.values],
+                        textposition='auto',
+                    ))
+                    fig_heat.update_layout(
+                        height=300, margin=dict(l=0, r=0, t=10, b=10),
+                        template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        xaxis=dict(title="Momentum Score Promedio", showgrid=False),
+                        yaxis=dict(showgrid=False)
+                    )
+                    st.plotly_chart(fig_heat, use_container_width=True)
+
+                with dash_col2:
+                    st.markdown("#### 🚀 Salud del Mercado")
+                    bullish_count = len(df_res[df_res['Score'] >= 70])
+                    total_count = len(df_res)
+                    health_pct = (bullish_count / total_count * 100) if total_count > 0 else 0
+                    
+                    fig_gauge = go.Figure(go.Indicator(
+                        mode = "gauge+number",
+                        value = health_pct,
+                        domain = {'x': [0, 1], 'y': [0, 1]},
+                        title = {'text': "Fuerza Bullish %", 'font': {'size': 14}},
+                        gauge = {
+                            'axis': {'range': [0, 100], 'tickwidth': 1},
+                            'bar': {'color': "#28a745"},
+                            'steps': [
+                                {'range': [0, 40], 'color': "#444"},
+                                {'range': [40, 70], 'color': "#666"},
+                                {'range': [70, 100], 'color': "#28a745"}
+                            ],
+                            'threshold': {
+                                'line': {'color': "white", 'width': 4},
+                                'thickness': 0.75,
+                                'value': 70
+                            }
+                        }
+                    ))
+                    fig_gauge.update_layout(height=250, margin=dict(l=10, r=10, t=40, b=10), template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)')
+                    st.plotly_chart(fig_gauge, use_container_width=True)
+                
+                st.markdown("---")
+            else:
+                # Si no hay columna Sector (resultados antiguos), mostrar advertencia
+                st.warning("⚠️ Ejecuta un nuevo escaneo para ver el análisis de sectores.")
+
+            st.markdown("---")
+            st.success(f"✅ {len(df_res)} acciones encontradas con momentum alcista")
             
             # Colorear filas por Score
             def color_score(val):
@@ -1951,6 +2074,21 @@ def main():
                         """, unsafe_allow_html=True)
                         
                         st.markdown(analysis)
+                        
+                        # --- BOTÓN PARA GUARDAR EN DIARIO ---
+                        if st.button("💾 Guardar en mi Diario de Operaciones", use_container_width=True):
+                            # Preparar datos
+                            save_ok = market_db.save_journal_entry(
+                                ticker=selected_ticker,
+                                price=tech_row.get('Precio', 0),
+                                score=tech_row.get('Score', 0),
+                                verdict=verdict,
+                                reasoning=analysis[:500] + "..." # Truncar para la DB
+                            )
+                            if save_ok:
+                                st.success(f"✅ ¡{selected_ticker} guardado en tu Bitácora!")
+                            else:
+                                st.error("❌ Error al guardar en la base de datos.")
                 else:
                     st.warning("Configura GROQ_API_KEY en .env para habilitar el análisis IA.")
 
@@ -2183,13 +2321,52 @@ def main():
                 st.rerun()
 
     with tab_history:
-        st.subheader("📝 Bitácora del Trader")
-        history_df = market_db.get_predictions(ticker, limit=20)
-        if not history_df.empty:
-            history_df['Dirección'] = history_df['prediction_value'].map({1: 'Subida 🟢', 0: 'Bajada 🔴', -1: 'Neutral 🟡'})
-            st.dataframe(history_df[['execution_date', 'prediction_date', 'Dirección', 'prob_up', 'prob_down']], use_container_width=True)
+        st.subheader("📚 Centro de Registro y Bitácora")
+        
+        # Dos sub-pestañas internas o secciones
+        hist_sel = st.radio("Ver registros de:", ["📅 Diario de Operaciones (Scanner)", "🤖 Bitácora de Predicciones AI"], horizontal=True)
+        
+        if hist_sel == "📅 Diario de Operaciones (Scanner)":
+            st.markdown("#### 🗒️ Operaciones Guardadas del Scanner")
+            journal_data = market_db.get_journal_entries()
+            
+            if not journal_data.empty:
+                for idx, row in journal_data.iterrows():
+                    with st.expander(f"📌 {row['ticker']} - {row['entry_date']} ({row['verdict']})"):
+                        jcol1, jcol2, jcol3 = st.columns([1, 1, 1])
+                        
+                        # Intentar obtener precio actual
+                        try:
+                            cur_p = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
+                            perf = ((cur_p / row['entry_price']) - 1) * 100
+                            p_color = "#28a745" if perf >= 0 else "#dc3545"
+                        except:
+                            cur_p = "N/D"
+                            perf = 0
+                            p_color = "#bbb"
+
+                        jcol1.metric("Precio Entrada", f"${row['entry_price']:.2f}")
+                        jcol2.metric("Precio Actual", f"${cur_p:.2f}" if isinstance(cur_p, float) else cur_p, delta=f"{perf:.2f}%" if isinstance(cur_p, float) else None)
+                        jcol3.metric("Score Original", f"{row['score']}/100")
+                        
+                        st.markdown("**🧠 Razonamiento IA:**")
+                        st.caption(row['reasoning'])
+                        
+                        if st.button(f"🗑️ Eliminar Registro {row['id']}", key=f"del_{row['id']}"):
+                            if market_db.delete_journal_entry(row['id']):
+                                st.success("Registro eliminado.")
+                                st.rerun()
+            else:
+                st.info("Aún no tienes operaciones guardadas. ¡Usa el Scanner para encontrar oportunidades!")
+        
         else:
-            st.info("No hay registros en la bitácora aún.")
+            st.markdown(f"#### 🤖 Registro de Predicciones: {ticker}")
+            history_df = market_db.get_predictions(ticker, limit=30)
+            if not history_df.empty:
+                history_df['Dirección'] = history_df['prediction_value'].map({1: 'Subida 🟢', 0: 'Bajada 🔴', -1: 'Neutral 🟡'})
+                st.dataframe(history_df[['execution_date', 'prediction_date', 'Dirección', 'prob_up', 'prob_down']], use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay registros de predicciones para este activo aún.")
 
 
 
