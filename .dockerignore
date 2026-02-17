@@ -1,0 +1,38 @@
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.python-version
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Project Metadata
+.git/
+.gitignore
+.dockerignore
+LICENSE
+README.md
+
+# Build Artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Editor
+.idea/
+.vscode/
+
+# Local data (optional)
+*.csv
+sp500_model.joblib
+market_data.db
+*.xlsx

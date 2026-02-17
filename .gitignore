@@ -1,0 +1,45 @@
+# Environment variables (CRITICAL - never commit API keys!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Streamlit
+.streamlit/
+
+# Data files (local cache)
+*.db
+*.sqlite
+*.sqlite3
+market_data.db
+
+# Model files (can be large)
+*.joblib
+model_*.joblib
+sp500_model.joblib
+
+# CSV exports
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
