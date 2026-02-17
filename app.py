@@ -639,7 +639,14 @@ TU ANÁLISIS (en español, Max 250 palabras):
 3. JUSTIFICACIÓN FUNDAMENTAL (2 líneas)
 4. NIVELES CLAVE: Soporte y Resistencia basados en Fibonacci
 5. RIESGO: Bajo / Medio / Alto (y por qué)
-6. HORIZONTE: Cuánto tiempo mantener la posición"""
+6. HORIZONTE: Cuánto tiempo mantener la posición
+7. STOP LOSS RECOMENDADO: Nivel técnico sugerido basado en Fibonacci (inferior al soporte actual).
+8. TAKE PROFIT RECOMENDADO: Nivel técnico sugerido basado en Fibonacci (Resistencia superior).
+
+IMPORTANTE: Al final del análisis, incluye SIEMPRE una línea exacta con este formato: [SL: valor, TP: valor] usando números decimales."""
+
+
+
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -749,12 +756,21 @@ class MarketDB:
                     ticker TEXT,
                     entry_date TEXT,
                     entry_price REAL,
+                    sl_price REAL,
+                    tp_price REAL,
                     score INTEGER,
                     verdict TEXT,
                     reasoning TEXT,
                     status TEXT DEFAULT 'OPEN'
                 )
             ''')
+            # Migración: Añadir columnas si no existen (evita errores en DBs viejas)
+            try:
+                cursor.execute("ALTER TABLE journal ADD COLUMN sl_price REAL")
+                cursor.execute("ALTER TABLE journal ADD COLUMN tp_price REAL")
+            except:
+                pass 
+
             conn.commit()
             conn.close()
         except Error as e:
@@ -839,26 +855,28 @@ class MarketDB:
         conn.close()
         return df
 
-    def save_journal_entry(self, ticker, price, score, verdict, reasoning):
+    def save_journal_entry(self, ticker, price, score, verdict, reasoning, sl=0.0, tp=0.0):
         conn = None
         try:
             conn = sqlite3.connect(self.db_file)
             now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
             
             # --- CONVERSIÓN ESTRICTA DE TIPOS ---
-            # SQLite no se lleva bien con numpy types
             t_val = str(ticker)
             d_val = str(now)
             p_val = float(price)
             s_val = int(score)
             v_val = str(verdict)
             r_val = str(reasoning)
+            sl_val = float(sl)
+            tp_val = float(tp)
             
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO journal (ticker, entry_date, entry_price, score, verdict, reasoning, status)
-                VALUES (?, ?, ?, ?, ?, ?, 'OPEN')
-            ''', (t_val, d_val, p_val, s_val, v_val, r_val))
+                INSERT INTO journal (ticker, entry_date, entry_price, sl_price, tp_price, score, verdict, reasoning, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+            ''', (t_val, d_val, p_val, sl_val, tp_val, s_val, v_val, r_val))
+
             
             conn.commit()
             return True
@@ -1845,8 +1863,21 @@ def main():
             risk_amount = account_size * (risk_pct / 100)
             st.info(f"Riesgo Máximo: **${risk_amount:.2f}**")
             
-            calc_entry = st.number_input("Precio Entrada ($)", value=0.0, step=0.1)
-            calc_stop = st.number_input("Stop Loss ($)", value=0.0, step=0.1)
+            # Inicializar valores en session_state si no existen
+            if 'calc_entry' not in st.session_state: st.session_state['calc_entry'] = 0.0
+            if 'calc_stop' not in st.session_state: st.session_state['calc_stop'] = 0.0
+            if 'calc_tp' not in st.session_state: st.session_state['calc_tp'] = 0.0
+
+            # Usar variables locales para los widgets, alimentados por el estado
+            calc_entry = st.number_input("Precio Entrada ($)", value=float(st.session_state['calc_entry']), step=0.1)
+            calc_stop = st.number_input("Stop Loss ($)", value=float(st.session_state['calc_stop']), step=0.1)
+            calc_tp = st.number_input("Take Profit ($)", value=float(st.session_state['calc_tp']), step=0.1)
+            
+            # Actualizar el estado con el valor actual del widget para persistencia
+            st.session_state['calc_entry'] = calc_entry
+            st.session_state['calc_stop'] = calc_stop
+            st.session_state['calc_tp'] = calc_tp
+
             
             if calc_entry > 0 and calc_stop > 0 and calc_entry > calc_stop:
                 risk_per_share = calc_entry - calc_stop
@@ -1856,8 +1887,18 @@ def main():
                 st.markdown("---")
                 st.success(f"🎯 **Comprar: {shares} acciones**")
                 st.caption(f"Valor Posición: ${position_value:,.2f}")
+
+                # Cálculo de R/R si hay Take Profit
+                if calc_tp > calc_entry:
+                    profit_per_share = calc_tp - calc_entry
+                    total_profit = shares * profit_per_share
+                    rr_ratio = profit_per_share / risk_per_share
+                    st.info(f"💰 Ganancia Estimada: **${total_profit:.2f}**\n\n⚖️ R/R Ratio: **1:{rr_ratio:.2f}**")
+
+
                 
                 if position_value > account_size:
+
                     st.warning("⚠️ ¡Cuidado! Esta posición usa margin (aplacamiento).")
             elif calc_entry > 0 and calc_stop >= calc_entry:
                 st.error("El Stop Loss debe ser menor a la Entrada.")
@@ -2161,9 +2202,23 @@ def main():
                         
                         st.markdown(analysis)
                         
+                        # --- EXTRACCIÓN DE SL/TP PARA AUTOMATIZACIÓN ---
+                        ai_sl = 0.0
+                        ai_tp = 0.0
+                        try:
+                            import re
+                            # Buscar el patrón [SL: valor, TP: valor]
+                            pattern = r'\[SL:\s*([\d\.]+),\s*TP:\s*([\d\.]+)\]'
+                            match = re.search(pattern, analysis)
+                            if match:
+                                ai_sl = float(match.group(1))
+                                ai_tp = float(match.group(2))
+                        except:
+                            pass
+
                         # --- LÓGICA DE GUARDADO CON CALLBACK ---
-                        def save_trade_callback(t, p, s, v, r):
-                            success = market_db.save_journal_entry(t, p, s, v, r)
+                        def save_trade_callback(t, p, s, v, r, sl_v, tp_v):
+                            success = market_db.save_journal_entry(t, p, s, v, r, sl=sl_v, tp=tp_v)
                             if success:
                                 st.session_state['save_success'] = f"Trade de {t} guardado con éxito!"
                             else:
@@ -2176,8 +2231,9 @@ def main():
                             key=f"save_btn_{selected_ticker}", 
                             use_container_width=True,
                             on_click=save_trade_callback,
-                            args=(selected_ticker, tech_row.get('Precio', 0), tech_row.get('Score', 0), verdict, analysis[:500])
+                            args=(selected_ticker, tech_row.get('Precio', 0), tech_row.get('Score', 0), verdict, analysis[:500], ai_sl, ai_tp)
                         )
+
                 else:
                     st.warning("Configura GROQ_API_KEY en .env para habilitar el análisis IA.")
 
@@ -2453,16 +2509,70 @@ def main():
                         else:
                             jcol2.metric("Precio Actual", str(cur_p))
                             
-                        jcol3.metric("Score Original", f"{row['score']}/100")
+                        # Mostrar niveles de estrategia si existen (manejo de None para trades viejos)
+                        sl_v = row.get('sl_price') if row.get('sl_price') is not None else 0.0
+                        tp_v = row.get('tp_price') if row.get('tp_price') is not None else 0.0
+                        
+                        if float(sl_v) > 0 and float(tp_v) > 0:
+                            entry_p = float(row['entry_price'])
+                            risk = entry_p - float(sl_v)
+                            reward = float(tp_v) - entry_p
+                            rr = reward / risk if risk != 0 else 0
+                            jcol3.metric("Ratio R/R (IA)", f"1:{rr:.1f}")
+                        else:
+                            jcol3.metric("Score Original", f"{row['score']}/100")
+
+                        
+                        if sl_v > 0 or tp_v > 0:
+                            st.markdown(f"**🛡️ Estrategia Sugerida:** SL: `${sl_v:.2f}` | TP: `${tp_v:.2f}`")
+
                         
                         st.markdown("**🧠 Razonamiento IA:**")
                         st.caption(row['reasoning'])
                         
-                        if st.button(f"🗑️ Cerrar/Eliminar Trade {row['id']}", key=f"del_{row['id']}"):
-                            if market_db.delete_journal_entry(row['id']):
-                                st.success("Trade cerrado y eliminado del diario.")
-                                time.sleep(1)
+                        # --- BOTONES DE ACCIÓN ---
+                        hcol1, hcol2, hcol3, hcol4 = st.columns(4)
+                        
+                        with hcol1:
+                            if st.button(f"🎯 Entrada", key=f"load_{row['id']}", use_container_width=True):
+                                st.session_state['calc_entry'] = float(row['entry_price'])
+                                if sl_v > 0: st.session_state['calc_stop'] = float(sl_v)
+                                if tp_v > 0: st.session_state['calc_tp'] = float(tp_v)
                                 st.rerun()
+                        
+                        with hcol2:
+                            if st.button(f"🧠 Estrategia", key=f"load_strat_{row['id']}", use_container_width=True):
+                                st.session_state['calc_entry'] = float(row['entry_price'])
+                                st.session_state['calc_stop'] = float(sl_v) if sl_v > 0 else float(row['entry_price']) * 0.95
+                                st.session_state['calc_tp'] = float(tp_v) if tp_v > 0 else float(row['entry_price']) * 1.10
+                                st.rerun()
+
+
+
+                        
+                        with hcol3:
+                            if st.button(f"📈 Actual", key=f"load_curr_{row['id']}", use_container_width=True):
+                                with st.spinner("Buscando..."):
+                                    try:
+                                        actual_p = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
+                                        st.session_state['calc_entry'] = float(actual_p)
+                                        st.session_state['calc_stop'] = float(sl_v) if sl_v > 0 else float(actual_p) * 0.95
+                                        st.session_state['calc_tp'] = float(tp_v) if tp_v > 0 else float(actual_p) * 1.10
+                                        st.rerun()
+                                    except: st.error("Error")
+
+
+
+                        
+                        with hcol4:
+                            if st.button(f"🗑️ Eliminar", key=f"del_{row['id']}", use_container_width=True):
+                                if market_db.delete_journal_entry(row['id']):
+                                    st.success("Removido")
+                                    time.sleep(1)
+                                    st.rerun()
+
+
+
             else:
                 st.info("Tu bitácora está vacía. Guarda operaciones desde el Scanner.")
         
