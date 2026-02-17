@@ -1618,6 +1618,14 @@ def main():
         "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "🔬 Scanner", "📅 Agenda Económica", "📜 Historial"
     ])
 
+    # --- NOTIFICACIONES GLOBALES (Instantáneas tras Guardar) ---
+    if 'save_success' in st.session_state:
+        msg = st.session_state.pop('save_success')
+        st.balloons()
+        st.toast(msg, icon="✅")
+    if 'save_error' in st.session_state:
+        st.error(st.session_state.pop('save_error'))
+
     with tab_market:
         # Reloj y Estado (Header Prominente)
         status_text, status_code = check_market_status()
@@ -2133,20 +2141,12 @@ def main():
                         def save_trade_callback(t, p, s, v, r):
                             success = market_db.save_journal_entry(t, p, s, v, r)
                             if success:
-                                st.session_state['save_success'] = f"✅ ¡{t} guardado con éxito!"
-                                #st.balloons() # Reservado para ejecución directa
+                                st.session_state['save_success'] = f"Trade de {t} guardado con éxito!"
                             else:
                                 st.session_state['save_error'] = "❌ Error al guardar en base de datos."
 
                         st.write("---")
                         
-                        # Mostrar mensajes de estado de guardados anteriores
-                        if 'save_success' in st.session_state:
-                            st.success(st.session_state.pop('save_success'))
-                            st.balloons()
-                        if 'save_error' in st.session_state:
-                            st.error(st.session_state.pop('save_error'))
-
                         st.button(
                             "💾 Guardar en mi Diario de Operaciones", 
                             key=f"save_btn_{selected_ticker}", 
