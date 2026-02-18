@@ -438,8 +438,606 @@ def get_economic_calendar():
     except Exception as e:
         return pd.DataFrame({"Error": [f"Error en calendario híbrido: {str(e)}"]})
 
+# --- DEEP DIVE ANALYSIS MODULE ---
+
+def get_deep_financials(ticker):
+    """Extrae datos financieros profundos: Balance, Income Statement, Cash Flow."""
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        
+        # --- DATOS GENERALES ---
+        price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+        high_52 = info.get('fiftyTwoWeekHigh', 0)
+        low_52 = info.get('fiftyTwoWeekLow', 0)
+        dist_52h = ((price / high_52) - 1) * 100 if high_52 > 0 else 0
+        dist_52l = ((price / low_52) - 1) * 100 if low_52 > 0 else 0
+        
+        general = {
+            'shortName': info.get('shortName', ticker),
+            'sector': info.get('sector', 'N/D'),
+            'industry': info.get('industry', 'N/D'),
+            'country': info.get('country', 'N/D'),
+            'employees': info.get('fullTimeEmployees', 0),
+            'website': info.get('website', ''),
+            'summary': info.get('longBusinessSummary', 'Sin descripción disponible.'),
+            'price': price,
+            'high_52': high_52,
+            'low_52': low_52,
+            'dist_52h': round(dist_52h, 1),
+            'dist_52l': round(dist_52l, 1),
+            'marketCap': info.get('marketCap', 0),
+            'enterpriseValue': info.get('enterpriseValue', 0),
+        }
+        
+        # --- VALUACIÓN ---
+        valuation = {
+            'trailingPE': info.get('trailingPE', None),
+            'forwardPE': info.get('forwardPE', None),
+            'pegRatio': info.get('pegRatio', None),
+            'priceToBook': info.get('priceToBook', None),
+            'priceToSales': info.get('priceToSalesTrailing12Months', None),
+            'evToRevenue': info.get('enterpriseToRevenue', None),
+            'evToEbitda': info.get('enterpriseToEbitda', None),
+        }
+        
+        # --- RENTABILIDAD ---
+        profitability = {
+            'profitMargin': info.get('profitMargins', None),
+            'operatingMargin': info.get('operatingMargins', None),
+            'grossMargin': info.get('grossMargins', None),
+            'returnOnEquity': info.get('returnOnEquity', None),
+            'returnOnAssets': info.get('returnOnAssets', None),
+        }
+        
+        # --- CRECIMIENTO ---
+        growth = {
+            'revenueGrowth': info.get('revenueGrowth', None),
+            'earningsGrowth': info.get('earningsGrowth', None),
+            'earningsQuarterlyGrowth': info.get('earningsQuarterlyGrowth', None),
+            'revenueQuarterlyGrowth': info.get('revenueQuarterlyGrowth', None),
+        }
+        
+        # --- SOLVENCIA Y DEUDA ---
+        solvency = {
+            'totalDebt': info.get('totalDebt', 0),
+            'totalCash': info.get('totalCash', 0),
+            'debtToEquity': info.get('debtToEquity', None),
+            'currentRatio': info.get('currentRatio', None),
+            'quickRatio': info.get('quickRatio', None),
+            'freeCashflow': info.get('freeCashflow', 0),
+            'operatingCashflow': info.get('operatingCashflow', 0),
+        }
+        
+        # --- DIVIDENDOS ---
+        dividends = {
+            'dividendYield': info.get('dividendYield', None),
+            'dividendRate': info.get('dividendRate', None),
+            'payoutRatio': info.get('payoutRatio', None),
+            'exDividendDate': info.get('exDividendDate', None),
+            'fiveYearAvgDividendYield': info.get('fiveYearAvgDividendYield', None),
+        }
+        
+        # --- RIESGO Y VOLATILIDAD ---
+        risk = {
+            'beta': info.get('beta', None),
+            'shortRatio': info.get('shortRatio', None),
+            'shortPercentOfFloat': info.get('shortPercentOfFloat', None),
+            'heldPercentInsiders': info.get('heldPercentInsiders', None),
+            'heldPercentInstitutions': info.get('heldPercentInstitutions', None),
+        }
+        
+        # --- EPS Y TARGETS ANALISTAS ---
+        analyst = {
+            'trailingEps': info.get('trailingEps', None),
+            'forwardEps': info.get('forwardEps', None),
+            'targetHighPrice': info.get('targetHighPrice', None),
+            'targetLowPrice': info.get('targetLowPrice', None),
+            'targetMeanPrice': info.get('targetMeanPrice', None),
+            'targetMedianPrice': info.get('targetMedianPrice', None),
+            'recommendationKey': info.get('recommendationKey', None),
+            'recommendationMean': info.get('recommendationMean', None),
+            'numberOfAnalystOpinions': info.get('numberOfAnalystOpinions', 0),
+        }
+        
+        # --- INGRESOS HISTÓRICOS (Income Statement) ---
+        income_history = []
+        try:
+            inc = t.financials
+            if inc is not None and not inc.empty:
+                for col in inc.columns:
+                    year_data = {}
+                    year_data['period'] = col.strftime('%Y') if hasattr(col, 'strftime') else str(col)
+                    year_data['totalRevenue'] = float(inc.loc['Total Revenue', col]) if 'Total Revenue' in inc.index else 0
+                    year_data['grossProfit'] = float(inc.loc['Gross Profit', col]) if 'Gross Profit' in inc.index else 0
+                    year_data['operatingIncome'] = float(inc.loc['Operating Income', col]) if 'Operating Income' in inc.index else 0
+                    year_data['netIncome'] = float(inc.loc['Net Income', col]) if 'Net Income' in inc.index else 0
+                    year_data['ebitda'] = float(inc.loc['EBITDA', col]) if 'EBITDA' in inc.index else 0
+                    income_history.append(year_data)
+        except:
+            pass
+
+        # --- BALANCE (Balance Sheet) ---
+        balance_data = {}
+        try:
+            bs = t.balance_sheet
+            if bs is not None and not bs.empty:
+                latest = bs.iloc[:, 0]
+                balance_data['totalAssets'] = float(latest.get('Total Assets', 0))
+                balance_data['totalLiabilities'] = float(latest.get('Total Liabilities Net Minority Interest', latest.get('Total Debt', 0)))
+                balance_data['totalEquity'] = float(latest.get('Stockholders Equity', latest.get('Total Equity Gross Minority Interest', 0)))
+                balance_data['cash'] = float(latest.get('Cash And Cash Equivalents', 0))
+                balance_data['totalDebt'] = float(latest.get('Total Debt', 0))
+        except:
+            pass
+
+        # --- CASH FLOW ---
+        cashflow_data = {}
+        try:
+            cf = t.cashflow
+            if cf is not None and not cf.empty:
+                latest = cf.iloc[:, 0]
+                cashflow_data['operatingCashflow'] = float(latest.get('Operating Cash Flow', latest.get('Total Cash From Operating Activities', 0)))
+                cashflow_data['capitalExpenditure'] = float(latest.get('Capital Expenditure', 0))
+                cashflow_data['freeCashflow'] = cashflow_data['operatingCashflow'] + cashflow_data['capitalExpenditure']
+                cashflow_data['dividendsPaid'] = float(latest.get('Common Stock Dividend Paid', latest.get('Cash Dividends Paid', 0)))
+                cashflow_data['shareRepurchase'] = float(latest.get('Repurchase Of Capital Stock', 0))
+        except:
+            pass
+        
+        return {
+            'general': general,
+            'valuation': valuation,
+            'profitability': profitability,
+            'growth': growth,
+            'solvency': solvency,
+            'dividends': dividends,
+            'risk': risk,
+            'analyst': analyst,
+            'income_history': income_history,
+            'balance': balance_data,
+            'cashflow': cashflow_data,
+            'success': True
+        }
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+
+def calculate_financial_health_score(fin_data):
+    """Calcula un score de salud financiera (0-100) basado en 6 dimensiones."""
+    scores = {}
+    details = {}
+    
+    # 1. VALUACIÓN (¿Está cara o barata?) - 20 pts máx
+    val_score = 10  # Neutral base
+    val_notes = []
+    pe = fin_data['valuation'].get('forwardPE') or fin_data['valuation'].get('trailingPE')
+    peg = fin_data['valuation'].get('pegRatio')
+    pb = fin_data['valuation'].get('priceToBook')
+    
+    if pe is not None:
+        if pe < 0: val_score = 3; val_notes.append("P/E negativo (pérdidas)")
+        elif pe < 15: val_score = 18; val_notes.append("Valuación atractiva")
+        elif pe < 25: val_score = 14; val_notes.append("Valuación razonable")
+        elif pe < 40: val_score = 8; val_notes.append("Valuación elevada")
+        else: val_score = 4; val_notes.append("Valuación extrema")
+    
+    if peg is not None and peg > 0:
+        if peg < 1.0: val_score = min(val_score + 4, 20); val_notes.append("PEG < 1 (subvaluada vs crecimiento)")
+        elif peg > 2.5: val_score = max(val_score - 3, 0); val_notes.append("PEG alto (cara vs crecimiento)")
+    
+    scores['Valuación'] = min(val_score, 20)
+    details['Valuación'] = val_notes
+    
+    # 2. RENTABILIDAD (¿Es un buen negocio?) - 20 pts máx
+    prof_score = 0
+    prof_notes = []
+    roe = fin_data['profitability'].get('returnOnEquity')
+    margin = fin_data['profitability'].get('profitMargin')
+    op_margin = fin_data['profitability'].get('operatingMargin')
+    
+    if roe is not None:
+        if roe > 0.25: prof_score += 8; prof_notes.append("ROE excelente (>25%)")
+        elif roe > 0.15: prof_score += 6; prof_notes.append("ROE bueno (>15%)")
+        elif roe > 0.08: prof_score += 4; prof_notes.append("ROE aceptable")
+        elif roe > 0: prof_score += 2; prof_notes.append("ROE bajo")
+        else: prof_notes.append("ROE negativo")
+    
+    if margin is not None:
+        if margin > 0.20: prof_score += 7; prof_notes.append("Margen neto robusto (>20%)")
+        elif margin > 0.10: prof_score += 5; prof_notes.append("Margen neto saludable")
+        elif margin > 0.05: prof_score += 3; prof_notes.append("Margen neto ajustado")
+        elif margin > 0: prof_score += 1; prof_notes.append("Margen neto mínimo")
+        else: prof_notes.append("Margen negativo (pérdidas)")
+    
+    if op_margin is not None and op_margin > 0.15: prof_score += 5
+    
+    scores['Rentabilidad'] = min(prof_score, 20)
+    details['Rentabilidad'] = prof_notes
+    
+    # 3. CRECIMIENTO (¿Tiene futuro?) - 20 pts máx
+    growth_score = 0
+    growth_notes = []
+    rev_g = fin_data['growth'].get('revenueGrowth')
+    earn_g = fin_data['growth'].get('earningsGrowth')
+    
+    if rev_g is not None:
+        if rev_g > 0.25: growth_score += 10; growth_notes.append("Crecimiento de ingresos explosivo (>25%)")
+        elif rev_g > 0.10: growth_score += 7; growth_notes.append("Crecimiento de ingresos sólido")
+        elif rev_g > 0: growth_score += 4; growth_notes.append("Crecimiento de ingresos moderado")
+        else: growth_score += 1; growth_notes.append("Ingresos en contracción")
+    
+    if earn_g is not None:
+        if earn_g > 0.20: growth_score += 10; growth_notes.append("Beneficios creciendo rápidamente")
+        elif earn_g > 0.05: growth_score += 6; growth_notes.append("Beneficios creciendo")
+        elif earn_g > 0: growth_score += 3; growth_notes.append("Beneficios estables")
+        else: growth_score += 0; growth_notes.append("Beneficios cayendo")
+    
+    scores['Crecimiento'] = min(growth_score, 20)
+    details['Crecimiento'] = growth_notes
+    
+    # 4. SOLVENCIA (¿Puede sobrevivir una crisis?) - 20 pts máx
+    solv_score = 10  # Neutral
+    solv_notes = []
+    de_ratio = fin_data['solvency'].get('debtToEquity')
+    current = fin_data['solvency'].get('currentRatio')
+    fcf = fin_data['solvency'].get('freeCashflow', 0)
+    
+    if de_ratio is not None:
+        if de_ratio < 30: solv_score = 18; solv_notes.append("Deuda mínima (fortress balance)")
+        elif de_ratio < 80: solv_score = 14; solv_notes.append("Deuda controlada")
+        elif de_ratio < 150: solv_score = 8; solv_notes.append("Deuda considerable")
+        else: solv_score = 4; solv_notes.append("Alto apalancamiento")
+    
+    if current is not None:
+        if current > 2.0: solv_score = min(solv_score + 4, 20); solv_notes.append("Liquidez excelente")
+        elif current < 1.0: solv_score = max(solv_score - 4, 0); solv_notes.append("Riesgo de liquidez")
+    
+    if fcf and fcf > 0: solv_notes.append("Generación de caja positiva")
+    elif fcf and fcf < 0: solv_score = max(solv_score - 3, 0); solv_notes.append("Cash flow negativo")
+    
+    scores['Solvencia'] = min(solv_score, 20)
+    details['Solvencia'] = solv_notes
+    
+    # 5. MOMENTUM Y CONSENSO ANALISTAS - 10 pts máx
+    mom_score = 5
+    mom_notes = []
+    rec = fin_data['analyst'].get('recommendationMean')
+    target_mean = fin_data['analyst'].get('targetMeanPrice')
+    price = fin_data['general'].get('price', 0)
+    
+    if rec is not None:
+        if rec <= 1.5: mom_score = 10; mom_notes.append("Consenso: Strong Buy")
+        elif rec <= 2.2: mom_score = 8; mom_notes.append("Consenso: Buy")
+        elif rec <= 3.0: mom_score = 5; mom_notes.append("Consenso: Hold")
+        elif rec <= 3.8: mom_score = 3; mom_notes.append("Consenso: Underperform")
+        else: mom_score = 1; mom_notes.append("Consenso: Sell")
+    
+    if target_mean and price and price > 0:
+        upside = ((target_mean / price) - 1) * 100
+        mom_notes.append(f"Upside analistas: {upside:+.1f}%")
+        if upside > 20: mom_score = min(mom_score + 2, 10)
+        elif upside < -10: mom_score = max(mom_score - 2, 0)
+    
+    scores['Consenso'] = min(mom_score, 10)
+    details['Consenso'] = mom_notes
+    
+    # 6. RIESGO ESTRUCTURAL - 10 pts máx (10 = bajo riesgo)
+    risk_score = 7
+    risk_notes = []
+    beta = fin_data['risk'].get('beta')
+    short_pct = fin_data['risk'].get('shortPercentOfFloat')
+    insiders = fin_data['risk'].get('heldPercentInsiders')
+    
+    if beta is not None:
+        if beta < 0.8: risk_score = 9; risk_notes.append("Baja volatilidad (defensivo)")
+        elif beta < 1.2: risk_score = 7; risk_notes.append("Volatilidad de mercado")
+        elif beta < 1.8: risk_score = 4; risk_notes.append("Alta volatilidad")
+        else: risk_score = 2; risk_notes.append("Volatilidad extrema")
+    
+    if short_pct is not None:
+        if short_pct > 0.15: risk_score = max(risk_score - 3, 0); risk_notes.append("Alto short interest (>15%)")
+        elif short_pct > 0.08: risk_notes.append("Short interest moderado")
+    
+    if insiders is not None and insiders > 0.10: risk_notes.append(f"Insiders poseen {insiders*100:.1f}%")
+    
+    scores['Riesgo'] = min(risk_score, 10)
+    details['Riesgo'] = risk_notes
+    
+    # TOTAL
+    total = sum(scores.values())
+    
+    # Clasificación
+    if total >= 80: grade = "A+"; grade_text = "INVERSIÓN PREMIUM"; grade_color = "#00e676"
+    elif total >= 70: grade = "A"; grade_text = "MUY BUENA INVERSIÓN"; grade_color = "#28a745"
+    elif total >= 60: grade = "B+"; grade_text = "BUENA INVERSIÓN"; grade_color = "#4ade80"
+    elif total >= 50: grade = "B"; grade_text = "INVERSIÓN ACEPTABLE"; grade_color = "#ffc107"
+    elif total >= 40: grade = "C"; grade_text = "INVERSIÓN ESPECULATIVA"; grade_color = "#fd7e14"
+    elif total >= 30: grade = "D"; grade_text = "ALTO RIESGO"; grade_color = "#dc3545"
+    else: grade = "F"; grade_text = "NO RECOMENDADA"; grade_color = "#ff1744"
+    
+    return {
+        'scores': scores,
+        'details': details,
+        'total': total,
+        'grade': grade,
+        'grade_text': grade_text,
+        'grade_color': grade_color
+    }
+
+
+def get_deep_technical_analysis(ticker):
+    """Análisis técnico profundo multi-timeframe."""
+    try:
+        t = yf.Ticker(ticker)
+        
+        # Datos diarios (6 meses)
+        daily = t.history(period='6mo', interval='1d', auto_adjust=True)
+        if daily.empty:
+            return None
+        
+        if isinstance(daily.columns, pd.MultiIndex):
+            daily.columns = daily.columns.get_level_values(0)
+        
+        price = daily['Close'].iloc[-1]
+        
+        # Medias Móviles
+        ema_9 = daily['Close'].ewm(span=9).mean().iloc[-1]
+        ema_20 = daily['Close'].ewm(span=20).mean().iloc[-1]
+        ema_50 = daily['Close'].ewm(span=50).mean().iloc[-1]
+        sma_200 = daily['Close'].rolling(200).mean().iloc[-1] if len(daily) >= 200 else None
+        
+        # RSI
+        rsi = calculate_rsi(daily['Close']).iloc[-1]
+        
+        # MACD
+        exp1 = daily['Close'].ewm(span=12, adjust=False).mean()
+        exp2 = daily['Close'].ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        macd_val = macd.iloc[-1]
+        signal_val = signal.iloc[-1]
+        macd_hist = macd_val - signal_val
+        
+        # Bollinger Bands
+        bb_mid = daily['Close'].rolling(20).mean().iloc[-1]
+        bb_std = daily['Close'].rolling(20).std().iloc[-1]
+        bb_upper = bb_mid + (bb_std * 2)
+        bb_lower = bb_mid - (bb_std * 2)
+        bb_position = ((price - bb_lower) / (bb_upper - bb_lower)) * 100 if (bb_upper - bb_lower) > 0 else 50
+        
+        # ATR y ADX
+        atr = calculate_atr(daily).iloc[-1]
+        adx = calculate_adx(daily).iloc[-1]
+        
+        # Volumen
+        avg_vol_20 = daily['Volume'].tail(20).mean()
+        avg_vol_50 = daily['Volume'].tail(50).mean()
+        vol_today = daily['Volume'].iloc[-1]
+        vol_ratio = vol_today / avg_vol_20 if avg_vol_20 > 0 else 0
+        
+        # Cambios porcentuales
+        chg_1d = ((price / daily['Close'].iloc[-2]) - 1) * 100 if len(daily) > 1 else 0
+        chg_5d = ((price / daily['Close'].iloc[-6]) - 1) * 100 if len(daily) > 5 else 0
+        chg_1m = ((price / daily['Close'].iloc[-22]) - 1) * 100 if len(daily) > 22 else 0
+        chg_3m = ((price / daily['Close'].iloc[-66]) - 1) * 100 if len(daily) > 66 else 0
+        chg_6m = ((price / daily['Close'].iloc[0]) - 1) * 100
+        
+        # Fibonacci (6 meses)
+        fib_high = daily['High'].max()
+        fib_low = daily['Low'].min()
+        fib_diff = fib_high - fib_low
+        fib_levels = {
+            '0% (Max)': fib_high,
+            '23.6%': fib_high - 0.236 * fib_diff,
+            '38.2%': fib_high - 0.382 * fib_diff,
+            '50%': fib_high - 0.5 * fib_diff,
+            '61.8%': fib_high - 0.618 * fib_diff,
+            '78.6%': fib_high - 0.786 * fib_diff,
+            '100% (Min)': fib_low
+        }
+        
+        # Tendencia
+        trend_score = 0
+        if price > ema_20: trend_score += 1
+        if price > ema_50: trend_score += 1
+        if sma_200 and price > sma_200: trend_score += 1
+        if ema_20 > ema_50: trend_score += 1
+        if macd_hist > 0: trend_score += 1
+        
+        if trend_score >= 4: trend_status = "ALCISTA FUERTE"
+        elif trend_score >= 3: trend_status = "ALCISTA"
+        elif trend_score >= 2: trend_status = "NEUTRAL"
+        elif trend_score >= 1: trend_status = "BAJISTA"
+        else: trend_status = "BAJISTA FUERTE"
+        
+        # Volatilidad diaria
+        daily_vol = daily['Close'].pct_change().tail(20).std()
+        
+        return {
+            'price': price,
+            'ema_9': ema_9, 'ema_20': ema_20, 'ema_50': ema_50, 'sma_200': sma_200,
+            'rsi': rsi,
+            'macd': macd_val, 'signal': signal_val, 'macd_hist': macd_hist,
+            'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_position': bb_position,
+            'atr': atr, 'adx': adx,
+            'vol_ratio': vol_ratio, 'avg_vol_20': avg_vol_20,
+            'chg_1d': chg_1d, 'chg_5d': chg_5d, 'chg_1m': chg_1m, 'chg_3m': chg_3m, 'chg_6m': chg_6m,
+            'fib_levels': fib_levels,
+            'trend_score': trend_score, 'trend_status': trend_status,
+            'daily_data': daily,
+            'daily_vol': daily_vol,
+        }
+    except Exception as e:
+        print(f"Error Deep Technical: {e}")
+        return None
+
+
+def ai_deep_dive_analysis(api_key, ticker, fin_data, tech_data, options_data=None):
+    """Genera un análisis IA exhaustivo de inversión combinando TODOS los datos."""
+    if not api_key:
+        return "Sin API Key de IA. Configura GROQ_API_KEY en .env"
+    
+    try:
+        g = fin_data['general']
+        v = fin_data['valuation']
+        p = fin_data['profitability']
+        gr = fin_data['growth']
+        s = fin_data['solvency']
+        a = fin_data['analyst']
+        r = fin_data['risk']
+        
+        # Formateo
+        def fmt_num(val, suffix='', pct=False, billions=False):
+            if val is None: return 'N/D'
+            if billions:
+                if abs(val) >= 1e12: return f"{val/1e12:.1f}T{suffix}"
+                if abs(val) >= 1e9: return f"{val/1e9:.1f}B{suffix}"
+                if abs(val) >= 1e6: return f"{val/1e6:.0f}M{suffix}"
+                return f"{val:,.0f}{suffix}"
+            if pct: return f"{val*100:.1f}%"
+            return f"{val:.2f}{suffix}"
+        
+        # Fibonacci string
+        fib_str = ""
+        if tech_data and tech_data.get('fib_levels'):
+            for name, price in tech_data['fib_levels'].items():
+                fib_str += f"\n  {name}: {price:.2f}"
+        
+        # Income history string
+        inc_str = ""
+        for yr in fin_data.get('income_history', [])[:4]:
+            inc_str += f"\n  {yr['period']}: Ingresos={fmt_num(yr['totalRevenue'], billions=True)} | Beneficio Neto={fmt_num(yr['netIncome'], billions=True)} | EBITDA={fmt_num(yr['ebitda'], billions=True)}"
+        
+        prompt = f"""Eres el DIRECTOR DE INVESTIGACIÓN de un Fondo de Cobertura con 20 años de experiencia. 
+Realiza un ANÁLISIS DE INVERSIÓN INSTITUCIONAL sobre esta empresa. Tu informe será leído por inversores sofisticados.
+
+═══════════════════════════════════════
+ PERFIL: {g['shortName']} ({ticker})
+═══════════════════════════════════════
+Sector: {g.get('sector', 'N/D')} | Industria: {g.get('industry', 'N/D')} | País: {g.get('country', 'N/D')}
+Empleados: {g.get('employees', 0) or 0:,}
+Capitalización: {fmt_num(g.get('marketCap', 0), billions=True)}
+Enterprise Value: {fmt_num(g.get('enterpriseValue', 0), billions=True)}
+Precio Actual: {fmt_num(g.get('price', 0))} | 52W High: {fmt_num(g.get('high_52', 0))} ({g.get('dist_52h', 0) or 0:+.1f}%) | 52W Low: {fmt_num(g.get('low_52', 0))} ({g.get('dist_52l', 0) or 0:+.1f}%)
+
+═══ VALUACIÓN ═══
+P/E Trailing: {fmt_num(v['trailingPE'], 'x')} | P/E Forward: {fmt_num(v['forwardPE'], 'x')}
+PEG Ratio: {fmt_num(v['pegRatio'])} | P/B: {fmt_num(v['priceToBook'], 'x')}
+P/S: {fmt_num(v['priceToSales'], 'x')} | EV/Revenue: {fmt_num(v['evToRevenue'], 'x')} | EV/EBITDA: {fmt_num(v['evToEbitda'], 'x')}
+
+═══ RENTABILIDAD ═══
+Margen Bruto: {fmt_num(p['grossMargin'], pct=True)} | Margen Operativo: {fmt_num(p['operatingMargin'], pct=True)} | Margen Neto: {fmt_num(p['profitMargin'], pct=True)}
+ROE: {fmt_num(p['returnOnEquity'], pct=True)} | ROA: {fmt_num(p['returnOnAssets'], pct=True)}
+
+═══ CRECIMIENTO ═══
+Crecimiento Ingresos: {fmt_num(gr['revenueGrowth'], pct=True)} | Crecimiento Beneficios: {fmt_num(gr['earningsGrowth'], pct=True)}
+Crecimiento Trimestral (Rev): {fmt_num(gr['revenueQuarterlyGrowth'], pct=True)} | (Earn): {fmt_num(gr['earningsQuarterlyGrowth'], pct=True)}
+
+═══ HISTORIAL FINANCIERO ═══{inc_str if inc_str else '  No disponible'}
+
+═══ SOLVENCIA Y DEUDA ═══
+Deuda Total: {fmt_num(s['totalDebt'], billions=True)} | Cash: {fmt_num(s['totalCash'], billions=True)}
+Deuda/Equity: {fmt_num(s['debtToEquity'])} | Current Ratio: {fmt_num(s['currentRatio'])} | Quick Ratio: {fmt_num(s['quickRatio'])}
+Free Cash Flow: {fmt_num(s['freeCashflow'], billions=True)} | Operating CF: {fmt_num(s['operatingCashflow'], billions=True)}
+
+═══ RIESGO ═══
+Beta: {fmt_num(r['beta'])} | Short Ratio: {fmt_num(r['shortRatio'])}
+Short % Float: {fmt_num(r['shortPercentOfFloat'], pct=True)}
+Insiders: {fmt_num(r['heldPercentInsiders'], pct=True)} | Instituciones: {fmt_num(r['heldPercentInstitutions'], pct=True)}
+
+═══ CONSENSO ANALISTAS ({a['numberOfAnalystOpinions']} analistas) ═══
+Recomendación: {a.get('recommendationKey', 'N/D')} (Score: {fmt_num(a['recommendationMean'])}/5)
+EPS Trailing: {fmt_num(a['trailingEps'])} | EPS Forward: {fmt_num(a['forwardEps'])}
+Precio Objetivo: Min {fmt_num(a['targetLowPrice'])} | Media {fmt_num(a['targetMeanPrice'])} | Max {fmt_num(a['targetHighPrice'])}"""
+
+        if tech_data:
+            sma200_str = f"{tech_data['sma_200']:.2f}" if tech_data.get('sma_200') else 'N/D'
+            prompt += f"""
+
+═══ ANÁLISIS TÉCNICO ═══
+Tendencia: {tech_data['trend_status']} (Score: {tech_data['trend_score']}/5)
+Precio: {tech_data.get('price', 0):.2f} | EMA9: {tech_data.get('ema_9', 0):.2f} | EMA20: {tech_data.get('ema_20', 0):.2f} | EMA50: {tech_data.get('ema_50', 0):.2f}
+SMA200: {sma200_str}
+RSI(14): {tech_data.get('rsi', 0):.1f} | ADX: {tech_data.get('adx', 0):.1f}
+MACD: {tech_data.get('macd', 0):.4f} | Señal: {tech_data.get('signal', 0):.4f} | Histograma: {tech_data.get('macd_hist', 0):.4f}
+Bollinger: Posición {tech_data.get('bb_position', 50):.0f}% (Lower: {tech_data.get('bb_lower', 0):.2f} | Upper: {tech_data.get('bb_upper', 0):.2f})
+ATR(14): {tech_data.get('atr', 0):.2f} | Vol Ratio: {tech_data.get('vol_ratio', 0):.2f}x
+Performance: 1D={tech_data.get('chg_1d', 0):+.2f}% | 5D={tech_data.get('chg_5d', 0):+.2f}% | 1M={tech_data.get('chg_1m', 0):+.2f}% | 3M={tech_data.get('chg_3m', 0):+.2f}% | 6M={tech_data.get('chg_6m', 0):+.2f}%
+Fibonacci (6M):{fib_str}"""
+        
+        if options_data:
+            prompt += f"""
+
+═══ FLUJO DE OPCIONES (Smart Money) ═══
+Put/Call Ratio: {options_data.get('ratio', 0):.2f} | Sentimiento: {options_data.get('sent', 'N/D')}
+Call Wall (Resistencia): {options_data.get('call_wall', 0):,.0f} | Put Wall (Soporte): {options_data.get('put_wall', 0):,.0f}
+Vol. Calls: {int(options_data.get('vol_calls', 0)):,} | Vol. Puts: {int(options_data.get('vol_puts', 0)):,}"""
+
+        prompt += """
+
+═══════════════════════════════════════
+TU INFORME DE INVERSIÓN (en español, estilo institucional):
+═══════════════════════════════════════
+
+Estructura tu respuesta EXACTAMENTE así:
+
+## 1. RESUMEN EJECUTIVO
+Una breve sinopsis de la empresa, su posición competitiva y tu conclusión principal (3-4 líneas).
+
+## 2. TESIS DE INVERSIÓN
+¿Por qué un inversor debería (o no) considerar esta acción? Argumenta con los datos financieros.
+
+## 3. FORTALEZAS (BULL CASE)
+Los 3 principales argumentos a favor de la inversión.
+
+## 4. RIESGOS (BEAR CASE)
+Los 3 principales riesgos o argumentos en contra.
+
+## 5. ANÁLISIS TÉCNICO
+¿Qué dice la estructura de precio? ¿En qué zona estamos? Menciona Fibonacci, RSI, tendencia y soportes/resistencias clave.
+
+## 6. POTENCIAL DE REVALORIZACIÓN
+Basándote en los targets de analistas y la estructura técnica, estima el potencial de subida/bajada (porcentaje) a 3, 6 y 12 meses.
+
+## 7. VEREDICTO FINAL
+- **Clasificación:** COMPRA FUERTE / COMPRA / MANTENER / VENDER / VENDER FUERTE
+- **Horizonte ideal:** Corto / Medio / Largo plazo
+- **Perfil de inversor requerido:** Conservador / Moderado / Agresivo
+- **Nivel de convicción:** Bajo / Medio / Alto
+- **Precio de Entrada Sugerido (si aplica)**
+- **Stop Loss Sugerido**
+- **Take Profit Sugerido**
+
+REGLAS:
+- Escribe con datos y argumentos, no con opiniones vagas.
+- Máximo 600 palabras.
+- No uses el símbolo '$' pegado a los números (usa USD o solo el número).
+- No uses formato LaTeX.
+- Al final, incluye la línea: [SL: valor, TP: valor]"""
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 2000
+        }
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                           headers=headers, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()['choices'][0]['message']['content']
+        return f"Error API ({resp.status_code}): {resp.text[:200]}"
+    except Exception as e:
+        return f"Error en análisis IA: {str(e)}"
+
+
 # --- MOMENTUM SCANNER ---
 SCANNER_UNIVERSE = [
+    'GLD', 'XBI', 'XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY', 'XOP',
     'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'BRK-B', 'AVGO', 'JPM',
     'LLY', 'V', 'UNH', 'MA', 'XOM', 'COST', 'HD', 'PG', 'JNJ', 'ABBV',
     'WMT', 'NFLX', 'CRM', 'BAC', 'ORCL', 'CVX', 'KO', 'MRK', 'AMD', 'PEP',
@@ -643,7 +1241,11 @@ TU ANÁLISIS (en español, Max 250 palabras):
 7. STOP LOSS RECOMENDADO: Nivel técnico sugerido basado en Fibonacci (inferior al soporte actual).
 8. TAKE PROFIT RECOMENDADO: Nivel técnico sugerido basado en Fibonacci (Resistencia superior).
 
-IMPORTANTE: Al final del análisis, incluye SIEMPRE una línea exacta con este formato: [SL: valor, TP: valor] usando números decimales."""
+IMPORTANTE: 
+- Al final del análisis, incluye SIEMPRE una línea exacta con este formato: [SL: valor, TP: valor] usando números decimales.
+- No uses el símbolo '$' pegado a los números, usa 'USD' o simplemente el número si es claro por el contexto.
+- Asegúrate de separar bien las palabras con espacios. NO uses formato LaTeX.
+"""
 
 
 
@@ -1651,8 +2253,8 @@ def main():
     model = load_model(ticker)
 
     # --- ESTRUCTURA DE PANTALLA: TORRE DE CONTROL ---
-    tab_market, tab_stats, tab_brain, tab_scanner, tab_calendar, tab_history = st.tabs([
-        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "🔬 Scanner", "📅 Agenda Económica", "📜 Historial"
+    tab_market, tab_stats, tab_brain, tab_scanner, tab_deepdive, tab_calendar, tab_history = st.tabs([
+        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "🔬 Scanner", "🔍 Deep Dive", "📅 Agenda Económica", "📜 Historial"
     ])
 
     # --- NOTIFICACIONES GLOBALES (Instantáneas tras Guardar) ---
@@ -2200,7 +2802,7 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                         
-                        st.markdown(analysis)
+                        st.markdown(analysis.replace("$", "\$"))
                         
                         # --- EXTRACCIÓN DE SL/TP PARA AUTOMATIZACIÓN ---
                         ai_sl = 0.0
@@ -2261,6 +2863,539 @@ def main():
             for _, row in cal_df.head(15).iterrows():
                 summary_cal.append(f"- {row.get('Fecha', '')} {row.get('Hora', '')} | {row.get('Evento', 'N/D')} | Act: {row.get('Actual', '-')} Prev: {row.get('Previsto', '-')}")
             st.session_state['calendar_text'] = "\n".join(summary_cal)
+
+    # --- DEEP DIVE TAB ---
+    with tab_deepdive:
+        st.markdown("""
+        <div style="padding:20px; border-radius:15px; background: linear-gradient(135deg, rgba(30,30,60,0.8), rgba(60,20,80,0.6)); border-left: 8px solid #a855f7; margin-bottom: 25px;">
+            <h2 style="margin:0; color:#e0e0e0;">🔍 Stock Deep Dive</h2>
+            <p style="margin:5px 0 0 0; color:#bbb; font-size:0.95em;">Análisis de inversión institucional. Introduce cualquier ticker para obtener un diagnóstico completo: financiero, técnico y estratégico.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Input de Ticker
+        dd_col_input1, dd_col_input2, dd_col_input3 = st.columns([2, 1, 1])
+        with dd_col_input1:
+            dd_ticker = st.text_input(
+                "🎯 Ticker del activo",
+                value="",
+                placeholder="Ej: AAPL, TSLA, MELI, NVDA...",
+                help="Escribe el símbolo de cualquier acción listada en Yahoo Finance.",
+                key="dd_ticker_input"
+            ).upper().strip()
+        with dd_col_input2:
+            dd_include_options = st.checkbox("📊 Incluir Opciones", value=True, help="Analizar flujo de opciones (P/C Ratio, Muros)")
+        with dd_col_input3:
+            dd_run = st.button("🚀 Ejecutar Deep Dive", use_container_width=True, type='primary', key='dd_run_btn')
+        
+        if dd_run and dd_ticker:
+            # --- FASE 1: RECOLECCIÓN DE DATOS ---
+            with st.spinner(f'📡 Recopilando inteligencia de {dd_ticker}...'):
+                dd_fin = get_deep_financials(dd_ticker)
+            
+            if not dd_fin.get('success'):
+                st.error(f"❌ No se pudo obtener datos de '{dd_ticker}'. Verifica que el ticker sea correcto (Ej: AAPL, TSLA, MELI).")
+            else:
+                st.session_state['dd_data'] = dd_fin
+                st.session_state['dd_ticker_active'] = dd_ticker
+                
+                with st.spinner('📊 Procesando análisis técnico...'):
+                    dd_tech = get_deep_technical_analysis(dd_ticker)
+                st.session_state['dd_tech'] = dd_tech
+                
+                dd_opts = None
+                if dd_include_options:
+                    with st.spinner('🎰 Leyendo flujo de opciones...'):
+                        dd_opts = get_options_sentiment(dd_ticker)
+                st.session_state['dd_opts'] = dd_opts
+                
+                # Health Score
+                dd_health = calculate_financial_health_score(dd_fin)
+                st.session_state['dd_health'] = dd_health
+        
+        # --- MOSTRAR RESULTADOS PERSISTENTES ---
+        if 'dd_data' in st.session_state and st.session_state.get('dd_ticker_active'):
+            dd_fin = st.session_state['dd_data']
+            dd_tech = st.session_state.get('dd_tech')
+            dd_opts = st.session_state.get('dd_opts')
+            dd_health = st.session_state.get('dd_health')
+            dd_ticker = st.session_state['dd_ticker_active']
+            g = dd_fin['general']
+            
+            # --- HEADER: PERFIL DE LA EMPRESA ---
+            st.markdown(f"""
+            <div style="padding:20px; border-radius:12px; background: rgba(0,0,0,0.3); margin-bottom:15px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+                    <div>
+                        <h2 style="margin:0; color:white;">{g['shortName']} ({dd_ticker})</h2>
+                        <p style="margin:3px 0; color:#aaa;">{g['sector']} | {g['industry']} | {g['country']}</p>
+                    </div>
+                    <div style="text-align:right;">
+                        <h2 style="margin:0; color:white;">{g['price']:.2f} USD</h2>
+                        <p style="margin:3px 0; color:#aaa;">52W: {g['low_52']:.2f} — {g['high_52']:.2f} ({g['dist_52h']:+.1f}%)</p>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # --- FILA 1: HEALTH SCORE + RADAR ---
+            st.markdown("### 🏥 Diagnóstico de Salud Financiera")
+            
+            h_col1, h_col2 = st.columns([1, 2])
+            
+            with h_col1:
+                # Gauge de Health Score
+                fig_health = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=dd_health['total'],
+                    domain={'x': [0, 1], 'y': [0, 1]},
+                    title={'text': f"<b>{dd_health['grade']}</b><br><span style='font-size:0.7em;color:{dd_health['grade_color']}'>{dd_health['grade_text']}</span>", 'font': {'size': 16}},
+                    gauge={
+                        'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': '#444'},
+                        'bar': {'color': dd_health['grade_color'], 'thickness': 0.3},
+                        'bgcolor': 'rgba(0,0,0,0)',
+                        'borderwidth': 0,
+                        'steps': [
+                            {'range': [0, 30], 'color': 'rgba(220,53,69,0.15)'},
+                            {'range': [30, 50], 'color': 'rgba(253,126,20,0.15)'},
+                            {'range': [50, 70], 'color': 'rgba(255,193,7,0.15)'},
+                            {'range': [70, 85], 'color': 'rgba(40,167,69,0.15)'},
+                            {'range': [85, 100], 'color': 'rgba(0,230,118,0.15)'},
+                        ],
+                        'threshold': {'line': {'color': 'white', 'width': 3}, 'thickness': 0.8, 'value': dd_health['total']}
+                    }
+                ))
+                fig_health.update_layout(height=280, margin=dict(l=20, r=20, t=60, b=10), paper_bgcolor='rgba(0,0,0,0)', font={'color': 'white'})
+                st.plotly_chart(fig_health, use_container_width=True)
+            
+            with h_col2:
+                # Radar Chart de Dimensiones
+                categories = list(dd_health['scores'].keys())
+                max_vals = [20, 20, 20, 20, 10, 10]
+                normalized = [(dd_health['scores'][c] / m) * 100 for c, m in zip(categories, max_vals)]
+                
+                fig_radar = go.Figure()
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=normalized + [normalized[0]],
+                    theta=categories + [categories[0]],
+                    fill='toself',
+                    fillcolor='rgba(168,85,247,0.2)',
+                    line=dict(color='#a855f7', width=2),
+                    name='Score'
+                ))
+                fig_radar.update_layout(
+                    polar=dict(
+                        radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(size=9, color='#666'), gridcolor='rgba(255,255,255,0.1)'),
+                        angularaxis=dict(tickfont=dict(size=11, color='#ccc'), gridcolor='rgba(255,255,255,0.1)'),
+                        bgcolor='rgba(0,0,0,0)',
+                    ),
+                    showlegend=False,
+                    height=300,
+                    margin=dict(l=60, r=60, t=30, b=30),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                )
+                st.plotly_chart(fig_radar, use_container_width=True)
+            
+            # Detalle del Score
+            with st.expander("📋 Detalle del Score por Dimensión", expanded=False):
+                for dim, pts in dd_health['scores'].items():
+                    max_p = 20 if dim in ['Valuación', 'Rentabilidad', 'Crecimiento', 'Solvencia'] else 10
+                    pct = (pts / max_p) * 100
+                    bar_color = '#28a745' if pct >= 70 else '#ffc107' if pct >= 40 else '#dc3545'
+                    notes = ' | '.join(dd_health['details'].get(dim, [])) or 'Sin datos suficientes'
+                    st.markdown(f"""
+                    <div style="margin-bottom:8px;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:2px;">
+                            <span style="font-weight:bold; color:#eee;">{dim}</span>
+                            <span style="color:{bar_color}; font-weight:bold;">{pts}/{max_p}</span>
+                        </div>
+                        <div style="background:rgba(255,255,255,0.1); border-radius:5px; height:8px; overflow:hidden;">
+                            <div style="background:{bar_color}; height:100%; width:{pct}%; border-radius:5px; transition: width 0.5s;"></div>
+                        </div>
+                        <p style="margin:2px 0 0 0; font-size:0.75em; color:#999;">{notes}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # --- FILA 2: MÉTRICAS CLAVE ---
+            st.markdown("### 📊 Métricas Clave")
+            
+            mk_col1, mk_col2, mk_col3, mk_col4, mk_col5, mk_col6 = st.columns(6)
+            
+            # Helpers
+            def fmt_v(val, pct=False, suffix=''):
+                if val is None: return 'N/D'
+                if pct: return f"{val*100:.1f}%"
+                return f"{val:.2f}{suffix}"
+            def fmt_b(val):
+                if val is None or val == 0: return 'N/D'
+                if abs(val) >= 1e12: return f"{val/1e12:.1f}T"
+                if abs(val) >= 1e9: return f"{val/1e9:.1f}B"
+                if abs(val) >= 1e6: return f"{val/1e6:.0f}M"
+                return f"{val:,.0f}"
+            
+            pe_val = dd_fin['valuation']['forwardPE'] or dd_fin['valuation']['trailingPE']
+            mk_col1.metric("P/E Ratio", fmt_v(pe_val, suffix='x'))
+            mk_col2.metric("PEG Ratio", fmt_v(dd_fin['valuation']['pegRatio']))
+            mk_col3.metric("Market Cap", fmt_b(g['marketCap']))
+            mk_col4.metric("ROE", fmt_v(dd_fin['profitability']['returnOnEquity'], pct=True))
+            mk_col5.metric("Margen Neto", fmt_v(dd_fin['profitability']['profitMargin'], pct=True))
+            mk_col6.metric("Crec. Ingresos", fmt_v(dd_fin['growth']['revenueGrowth'], pct=True))
+            
+            mk2_col1, mk2_col2, mk2_col3, mk2_col4, mk2_col5, mk2_col6 = st.columns(6)
+            mk2_col1.metric("Deuda/Equity", fmt_v(dd_fin['solvency']['debtToEquity']))
+            mk2_col2.metric("Current Ratio", fmt_v(dd_fin['solvency']['currentRatio']))
+            mk2_col3.metric("Free Cash Flow", fmt_b(dd_fin['solvency']['freeCashflow']))
+            mk2_col4.metric("Beta", fmt_v(dd_fin['risk']['beta']))
+            mk2_col5.metric("Div. Yield", fmt_v(dd_fin['dividends']['dividendYield'], pct=True))
+            mk2_col6.metric("EPS Forward", fmt_v(dd_fin['analyst']['forwardEps']))
+            
+            st.markdown("---")
+            
+            # --- FILA 3: GRÁFICOS (Income + Analyst Targets + Chart Técnico) ---
+            chart_col1, chart_col2 = st.columns([1, 1])
+            
+            with chart_col1:
+                st.markdown("#### 📈 Evolución de Resultados (Anual)")
+                inc_hist = dd_fin.get('income_history', [])
+                if inc_hist:
+                    inc_df = pd.DataFrame(inc_hist).sort_values('period')
+                    fig_inc = go.Figure()
+                    fig_inc.add_trace(go.Bar(
+                        x=inc_df['period'], y=inc_df['totalRevenue'],
+                        name='Ingresos', marker_color='rgba(99, 102, 241, 0.7)',
+                        text=[fmt_b(v) for v in inc_df['totalRevenue']], textposition='outside'
+                    ))
+                    fig_inc.add_trace(go.Bar(
+                        x=inc_df['period'], y=inc_df['netIncome'],
+                        name='Beneficio Neto', marker_color='rgba(16, 185, 129, 0.7)',
+                        text=[fmt_b(v) for v in inc_df['netIncome']], textposition='outside'
+                    ))
+                    fig_inc.update_layout(
+                        height=350, barmode='group',
+                        template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                        yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+                    )
+                    st.plotly_chart(fig_inc, use_container_width=True)
+                else:
+                    st.info("Sin historial de ingresos disponible para este activo.")
+            
+            with chart_col2:
+                st.markdown("#### 🎯 Precio Objetivo Analistas")
+                a = dd_fin['analyst']
+                if a.get('targetMeanPrice') and a.get('targetLowPrice') and a.get('targetHighPrice'):
+                    current_price = g['price']
+                    upside_mean = ((a['targetMeanPrice'] / current_price) - 1) * 100
+                    
+                    fig_target = go.Figure()
+                    fig_target.add_trace(go.Indicator(
+                        mode="number+delta",
+                        value=a['targetMeanPrice'],
+                        delta={'reference': current_price, 'relative': True, 'valueformat': '.1%'},
+                        title={'text': f"Target Medio ({a['numberOfAnalystOpinions']} analistas)", 'font': {'size': 14}},
+                        domain={'x': [0, 1], 'y': [0.6, 1]},
+                        number={'font': {'size': 36}}
+                    ))
+                    
+                    # Bar de rango de targets
+                    fig_target.add_trace(go.Bar(
+                        x=[a['targetLowPrice']],
+                        y=['Target'],
+                        orientation='h',
+                        marker_color='rgba(220,53,69,0.5)',
+                        name=f"Min: {a['targetLowPrice']:.2f}",
+                        width=0.4,
+                    ))
+                    fig_target.add_trace(go.Bar(
+                        x=[a['targetMeanPrice'] - a['targetLowPrice']],
+                        y=['Target'],
+                        orientation='h',
+                        marker_color='rgba(255,193,7,0.6)',
+                        name=f"Media: {a['targetMeanPrice']:.2f}",
+                        width=0.4,
+                    ))
+                    fig_target.add_trace(go.Bar(
+                        x=[a['targetHighPrice'] - a['targetMeanPrice']],
+                        y=['Target'],
+                        orientation='h',
+                        marker_color='rgba(40,167,69,0.6)',
+                        name=f"Max: {a['targetHighPrice']:.2f}",
+                        width=0.4,
+                    ))
+                    
+                    # Línea de precio actual
+                    fig_target.add_vline(
+                        x=current_price, line_dash='dash', line_color='white', line_width=2,
+                        annotation_text=f"Actual: {current_price:.2f}", annotation_position='top',
+                        annotation_font=dict(color='white', size=10)
+                    )
+                    
+                    fig_target.update_layout(
+                        height=350, barmode='stack',
+                        template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        legend=dict(orientation='h', yanchor='bottom', y=-0.15, font=dict(size=10)),
+                        showlegend=True,
+                        yaxis=dict(showgrid=False),
+                        xaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)', title='Precio (USD)'),
+                    )
+                    st.plotly_chart(fig_target, use_container_width=True)
+                else:
+                    rec_key = a.get('recommendationKey', 'N/D')
+                    st.info(f"Consenso de analistas: **{rec_key}**. Sin datos detallados de target para este activo.")
+            
+            st.markdown("---")
+            
+            # --- FILA 4: GRÁFICO TÉCNICO AVANZADO ---
+            if dd_tech:
+                st.markdown("### 📉 Análisis Técnico Avanzado")
+                
+                # Performance Badges
+                perf_cols = st.columns(5)
+                perf_data = [
+                    ('1 Día', dd_tech['chg_1d']),
+                    ('5 Días', dd_tech['chg_5d']),
+                    ('1 Mes', dd_tech['chg_1m']),
+                    ('3 Meses', dd_tech['chg_3m']),
+                    ('6 Meses', dd_tech['chg_6m']),
+                ]
+                for col, (label, val) in zip(perf_cols, perf_data):
+                    color = '#28a745' if val >= 0 else '#dc3545'
+                    col.markdown(f"""
+                    <div style="text-align:center; padding:8px; border-radius:8px; background:rgba(0,0,0,0.2); border: 1px solid {color};">
+                        <p style="margin:0; font-size:0.75em; color:#aaa;">{label}</p>
+                        <p style="margin:0; font-size:1.2em; font-weight:bold; color:{color};">{val:+.2f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Indicadores técnicos
+                ti_col1, ti_col2, ti_col3, ti_col4, ti_col5 = st.columns(5)
+                
+                rsi_color = '#dc3545' if dd_tech['rsi'] > 70 else '#28a745' if dd_tech['rsi'] < 30 else '#ffc107'
+                ti_col1.markdown(f"<div style='text-align:center;'><span style='color:#aaa; font-size:0.8em;'>RSI(14)</span><br><span style='color:{rsi_color}; font-weight:bold; font-size:1.3em;'>{dd_tech['rsi']:.1f}</span></div>", unsafe_allow_html=True)
+                
+                trend_color = '#28a745' if 'ALCISTA' in dd_tech['trend_status'] else '#dc3545' if 'BAJISTA' in dd_tech['trend_status'] else '#ffc107'
+                ti_col2.markdown(f"<div style='text-align:center;'><span style='color:#aaa; font-size:0.8em;'>Tendencia</span><br><span style='color:{trend_color}; font-weight:bold; font-size:0.9em;'>{dd_tech['trend_status']}</span></div>", unsafe_allow_html=True)
+                
+                adx_text = 'Fuerte' if dd_tech['adx'] > 25 else 'Débil'
+                ti_col3.markdown(f"<div style='text-align:center;'><span style='color:#aaa; font-size:0.8em;'>ADX ({adx_text})</span><br><span style='color:white; font-weight:bold; font-size:1.3em;'>{dd_tech['adx']:.1f}</span></div>", unsafe_allow_html=True)
+                
+                macd_color = '#28a745' if dd_tech['macd_hist'] > 0 else '#dc3545'
+                ti_col4.markdown(f"<div style='text-align:center;'><span style='color:#aaa; font-size:0.8em;'>MACD Hist</span><br><span style='color:{macd_color}; font-weight:bold; font-size:1.3em;'>{dd_tech['macd_hist']:.4f}</span></div>", unsafe_allow_html=True)
+                
+                vr_color = '#28a745' if dd_tech['vol_ratio'] > 1.2 else '#ffc107'
+                ti_col5.markdown(f"<div style='text-align:center;'><span style='color:#aaa; font-size:0.8em;'>Vol Ratio</span><br><span style='color:{vr_color}; font-weight:bold; font-size:1.3em;'>{dd_tech['vol_ratio']:.2f}x</span></div>", unsafe_allow_html=True)
+                
+                # Gráfico Candlestick con Fibonacci + EMAs
+                chart_data = dd_tech['daily_data']
+                fig_dd = go.Figure()
+                
+                fig_dd.add_trace(go.Candlestick(
+                    x=chart_data.index,
+                    open=chart_data['Open'], high=chart_data['High'],
+                    low=chart_data['Low'], close=chart_data['Close'],
+                    name=dd_ticker, increasing_line_color='#28a745', decreasing_line_color='#dc3545'
+                ))
+                
+                # EMAs
+                ema20_series = chart_data['Close'].ewm(span=20).mean()
+                ema50_series = chart_data['Close'].ewm(span=50).mean()
+                fig_dd.add_trace(go.Scatter(x=chart_data.index, y=ema20_series, name='EMA 20', line=dict(color='#00b4d8', width=1)))
+                fig_dd.add_trace(go.Scatter(x=chart_data.index, y=ema50_series, name='EMA 50', line=dict(color='#ff6b35', width=1)))
+                
+                # Bollinger Bands
+                bb_mid_s = chart_data['Close'].rolling(20).mean()
+                bb_std_s = chart_data['Close'].rolling(20).std()
+                fig_dd.add_trace(go.Scatter(x=chart_data.index, y=bb_mid_s + bb_std_s*2, name='BB Upper', line=dict(color='rgba(173,216,230,0.3)', width=0.8, dash='dot'), showlegend=False))
+                fig_dd.add_trace(go.Scatter(x=chart_data.index, y=bb_mid_s - bb_std_s*2, name='BB Lower', line=dict(color='rgba(173,216,230,0.3)', width=0.8, dash='dot'), fill='tonexty', fillcolor='rgba(173,216,230,0.04)', showlegend=False))
+                
+                # Fibonacci Levels
+                fib_colors = [
+                    ('23.6%', 'rgba(255,107,107,0.6)'),
+                    ('38.2%', 'rgba(255,169,77,0.6)'),
+                    ('50%', 'rgba(255,212,59,0.7)'),
+                    ('61.8%', 'rgba(105,219,124,0.7)'),
+                    ('78.6%', 'rgba(56,217,169,0.6)'),
+                ]
+                for fib_label, fib_color in fib_colors:
+                    fib_price = dd_tech['fib_levels'].get(fib_label)
+                    if fib_price:
+                        fig_dd.add_hline(
+                            y=fib_price, line_dash='dash', line_color=fib_color, line_width=0.8,
+                            annotation_text=f"{fib_label} {fib_price:.2f}",
+                            annotation_position='right',
+                            annotation_font=dict(size=8, color=fib_color),
+                            annotation_bgcolor='rgba(0,0,0,0.5)'
+                        )
+                
+                # Volumen
+                vol_colors = ['#28a745' if c >= o else '#dc3545' for c, o in zip(chart_data['Close'], chart_data['Open'])]
+                fig_dd.add_trace(go.Bar(x=chart_data.index, y=chart_data['Volume'], name='Volumen', marker_color=vol_colors, opacity=0.15, yaxis='y2'))
+                
+                fig_dd.update_layout(
+                    height=550,
+                    template='plotly_dark',
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                    xaxis_rangeslider_visible=False,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, font=dict(size=10)),
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    yaxis2=dict(overlaying='y', side='right', showgrid=False, showticklabels=False, range=[0, chart_data['Volume'].max() * 4])
+                )
+                st.plotly_chart(fig_dd, use_container_width=True)
+            
+            st.markdown("---")
+            
+            # --- FILA 5: OPCIONES + BALANCE ---
+            extra_col1, extra_col2 = st.columns(2)
+            
+            with extra_col1:
+                if dd_opts:
+                    st.markdown("#### 🎰 Flujo de Opciones (Smart Money)")
+                    st.markdown(f"""
+                    <div style="padding:15px; border-radius:10px; border: 1px solid {dd_opts['color']}; background: rgba(0,0,0,0.2);">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <h4 style="margin:0; color:{dd_opts['color']};">{dd_opts['sent']}</h4>
+                            <span style="font-size:0.8em; color:#fff; background:{dd_opts['color']}; padding:2px 8px; border-radius:10px;">P/C: {dd_opts['ratio']:.2f}</span>
+                        </div>
+                        <div style="margin-top:10px; padding:10px; background:rgba(255,255,255,0.05); border-radius:5px;">
+                            <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+                                <span style="color:#ff6b6b; font-weight:bold;">🧱 Call Wall:</span>
+                                <span style="color:white;">{dd_opts['call_wall']:,.0f}</span>
+                            </div>
+                            <div style="display:flex; justify-content:space-between;">
+                                <span style="color:#51cf66; font-weight:bold;">🛡️ Put Wall:</span>
+                                <span style="color:white;">{dd_opts['put_wall']:,.0f}</span>
+                            </div>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; font-size:0.75em; margin-top:8px; color:#999;">
+                            <span>Vol. Calls: {int(dd_opts['vol_calls']):,}</span>
+                            <span>Vol. Puts: {int(dd_opts['vol_puts']):,}</span>
+                            <span>Exp: {dd_opts['exp']}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.info("Sin datos de opciones para este activo.")
+            
+            with extra_col2:
+                st.markdown("#### 🏦 Estructura de Balance")
+                bal = dd_fin.get('balance', {})
+                if bal:
+                    assets = bal.get('totalAssets', 0)
+                    liab = bal.get('totalLiabilities', 0)
+                    equity = bal.get('totalEquity', 0)
+                    cash = bal.get('cash', 0)
+                    debt = bal.get('totalDebt', 0)
+                    
+                    if assets > 0:
+                        fig_bal = go.Figure()
+                        fig_bal.add_trace(go.Bar(
+                            x=['Activos', 'Pasivos', 'Patrimonio', 'Caja', 'Deuda'],
+                            y=[assets, liab, equity, cash, debt],
+                            marker_color=['#6366f1', '#f87171', '#22c55e', '#06b6d4', '#f59e0b'],
+                            text=[fmt_b(v) for v in [assets, liab, equity, cash, debt]],
+                            textposition='outside',
+                        ))
+                        fig_bal.update_layout(
+                            height=280,
+                            template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                            margin=dict(l=10, r=10, t=10, b=10),
+                            yaxis=dict(showgrid=True, gridcolor='rgba(255,255,255,0.05)'),
+                        )
+                        st.plotly_chart(fig_bal, use_container_width=True)
+                    else:
+                        st.info("Sin datos de balance disponibles.")
+                else:
+                    st.info("Sin datos de balance disponibles.")
+            
+            st.markdown("---")
+            
+            # --- FILA 6: DESCRIPCIÓN + DATOS ADICIONALES ---
+            with st.expander("📖 Descripción de la Empresa", expanded=False):
+                st.write(g.get('summary', 'Sin descripción disponible.'))
+                if g.get('website'):
+                    st.markdown(f"🌐 [{g['website']}]({g['website']})")
+                if g.get('employees') and g['employees'] > 0:
+                    st.markdown(f"👥 Empleados: **{g['employees']:,}**")
+            
+            st.markdown("---")
+            
+            # --- FILA 7: ANÁLISIS IA EXHAUSTIVO ---
+            st.markdown("### 🧠 Informe de Inversión IA")
+            
+            if groq_api_key:
+                if st.button(f"🧠 Generar Informe Institucional de {dd_ticker}", use_container_width=True, type='primary', key='dd_ai_btn'):
+                    with st.spinner(f'🔬 La IA está analizando {dd_ticker} en profundidad...'):
+                        dd_analysis = ai_deep_dive_analysis(groq_api_key, dd_ticker, dd_fin, dd_tech, dd_opts)
+                    
+                    st.session_state['dd_analysis'] = dd_analysis
+                
+                if 'dd_analysis' in st.session_state:
+                    dd_analysis = st.session_state['dd_analysis']
+                    
+                    # Extraer veredicto para visual
+                    dd_verdict = "ANÁLISIS"
+                    dd_v_color = "#a855f7"
+                    analysis_upper = dd_analysis.upper()
+                    if "COMPRA FUERTE" in analysis_upper: dd_verdict = "🟢 COMPRA FUERTE"; dd_v_color = "#00e676"
+                    elif "COMPRA" in analysis_upper and "NO COMPRA" not in analysis_upper: dd_verdict = "🟢 COMPRA"; dd_v_color = "#28a745"
+                    elif "VENDER FUERTE" in analysis_upper: dd_verdict = "🔴 VENDER FUERTE"; dd_v_color = "#ff1744"
+                    elif "VENDER" in analysis_upper: dd_verdict = "🔴 VENDER"; dd_v_color = "#dc3545"
+                    elif "MANTENER" in analysis_upper: dd_verdict = "🟡 MANTENER"; dd_v_color = "#ffc107"
+                    
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, rgba(0,0,0,0.4), rgba(30,30,60,0.4)); border-left: 6px solid {dd_v_color}; padding: 18px; border-radius: 12px; margin-bottom: 20px;">
+                        <h2 style="color:{dd_v_color}; margin:0; font-size: 1.3em;">{dd_verdict}</h2>
+                        <p style="margin:5px 0 0 0; color:#999; font-size:0.85em;">Informe generado por IA basado en {len(dd_fin.get('income_history', []))} años de datos financieros, análisis técnico de 6 meses y flujo de opciones.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.markdown(dd_analysis.replace("$", "\\$"))
+                    
+                    # Extracción de SL/TP
+                    dd_sl = 0.0
+                    dd_tp = 0.0
+                    try:
+                        pattern = r'\[SL:\s*([\d\.]+),\s*TP:\s*([\d\.]+)\]'
+                        match = re.search(pattern, dd_analysis)
+                        if match:
+                            dd_sl = float(match.group(1))
+                            dd_tp = float(match.group(2))
+                    except:
+                        pass
+                    
+                    # Botones de acción
+                    st.markdown("---")
+                    dd_act_col1, dd_act_col2 = st.columns(2)
+                    
+                    with dd_act_col1:
+                        def dd_save_callback(t, p, s, v, r, sl_v, tp_v):
+                            success = market_db.save_journal_entry(t, p, s, v, r, sl=sl_v, tp=tp_v)
+                            if success:
+                                st.session_state['save_success'] = f"Trade de {t} guardado con éxito!"
+                            else:
+                                st.session_state['save_error'] = "Error al guardar."
+                        
+                        st.button(
+                            "💾 Guardar en Diario de Operaciones",
+                            key=f"dd_save_{dd_ticker}",
+                            use_container_width=True,
+                            on_click=dd_save_callback,
+                            args=(dd_ticker, g['price'], dd_health['total'], dd_verdict, dd_analysis[:500], dd_sl, dd_tp)
+                        )
+                    
+                    with dd_act_col2:
+                        if dd_sl > 0 and dd_tp > 0:
+                            if st.button("🧮 Enviar a Calculadora de Riesgo", key='dd_calc_btn', use_container_width=True):
+                                st.session_state['calc_entry'] = float(g['price'])
+                                st.session_state['calc_stop'] = float(dd_sl)
+                                st.session_state['calc_tp'] = float(dd_tp)
+                                st.rerun()
+            else:
+                st.warning("⚠️ Configura GROQ_API_KEY en .env para habilitar el análisis IA profundo.")
 
     with tab_market:
         st.sidebar.markdown("---")
@@ -2382,7 +3517,7 @@ def main():
                         with st.spinner("Analizando estructura de mercado..."):
                             analysis = get_llm_analysis(groq_api_key, ctx)
                             st.info("### 🛡️ Informe Táctico (Intradía)")
-                            st.markdown(analysis)
+                            st.markdown(analysis.replace("$", "\$"))
                             
                     if btn_briefing:
                         with st.spinner("Leyendo noticias y cruzando datos..."):
@@ -2390,7 +3525,7 @@ def main():
                             cal_txt = st.session_state.get('calendar_text', "Sin eventos macro reportados.")
                             briefing = get_pre_market_briefing(groq_api_key, ctx, news, cal_txt)
                             st.success("### 🌅 Briefing Pre-Mercado (Macro + Técnico)")
-                            st.markdown(briefing)
+                            st.markdown(briefing.replace("$", "\$"))
                             st.markdown("---")
                             st.caption("📰 Titulares Fuente:")
                             st.text(news)
