@@ -26,6 +26,13 @@ try:
 except ImportError:
     pass
 
+# --- FIX: Event Loop for Windows/Streamlit/yfinance ---
+if os.name == 'nt':
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except:
+        pass
+
 # Lista de las 20 acciones más importantes (puedes modificar esta lista según tus preferencias)
 TOP_20_STOCKS = {
     'SPY ETF': 'SPY',
@@ -142,18 +149,20 @@ def get_weinstein_stage(df):
     # Definición de etapas
     # Etapa 2: Avanzando (Precio > SMA + SMA subiendo)
     if dist > 0.02 and slope > 0.005:
-        return "2 (Alcista)"
+        return "Etapa 2 (Alcista / Avance)"
     # Etapa 4: Declive (Precio < SMA + SMA bajando)
     elif dist < -0.02 and slope < -0.005:
-        return "4 (Bajista)"
+        return "Etapa 4 (Bajista / Declive)"
     # Etapa 1 o 3 (Consolidación / Techo)
     else:
-        # Si viene de abajo es Etapa 1 (Acumulación), si viene de arriba Etapa 3 (Distribución)
-        # Simplificamos como consolidación si el slope es plano
+        # Si el precio está cerca de la media o la media está plana
         if abs(slope) < 0.005:
-            if curr_price > curr_sma: return "3 (Distribución)"
-            else: return "1 (Acumulación)"
-        return "Transición"
+            if curr_price > curr_sma: return "Etapa 3 (Distribución / Techo)"
+            else: return "Etapa 1 (Acumulación / Suelo)"
+        
+        # Casos de transición
+        if slope > 0: return "Etapa 1-2 (Transición Alcista)"
+        else: return "Etapa 3-4 (Transición Bajista)"
 
 
 
@@ -235,13 +244,17 @@ def get_llm_analysis(api_key, context_data):
     2. ESTRATEGIA RECOMENDADA: ¿Es momento de Acumular, Mantener, Proteger o Liquidar?
     3. FACTOR DE RIESGO: ¿Cuál es el principal obstáculo para esta tesis de inversión?
     
+    REGLAS CRÍTICAS:
+    - ZERO HALLUCINATION: No inventes datos. Cíñete a los proporcionados.
+    - Si un dato aparece como 'N/A', no hagas suposiciones sobre él.
+    
     Responde en formato Markdown, con estilo profesional y estratégico. Sé directo.
     """
     
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.5
+        "temperature": 0.1
     }
     
     try:
@@ -438,7 +451,7 @@ def translate_text(api_key, text, target_lang="Spanish"):
         }
         prompt = f"Traduce el siguiente texto de descripción de empresa al {target_lang}. Mantén un tono profesional y técnico. No añadas comentarios extra, solo la traducción:\n\n{text}"
         payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model": "llama-3.1-8b-instant",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "max_tokens": 1000
@@ -562,14 +575,30 @@ def get_deep_financials(ticker):
         try:
             inc = t.financials
             if inc is not None and not inc.empty:
+                # Mapeo de nombres posibles para yfinance
+                map_inc = {
+                    'revenue': ['Total Revenue', 'Total Operating IncomeAs Reported', 'Operating Revenue'],
+                    'gross': ['Gross Profit'],
+                    'op_inc': ['Operating Income', 'Operating Income (Loss)'],
+                    'net': ['Net Income', 'Net Income Common Stockholders', 'Net Income From Continuing Operation Net Minority Interest'],
+                    'ebitda': ['EBITDA']
+                }
+                
                 for col in inc.columns:
                     year_data = {}
                     year_data['period'] = col.strftime('%Y') if hasattr(col, 'strftime') else str(col)
-                    year_data['totalRevenue'] = float(inc.loc['Total Revenue', col]) if 'Total Revenue' in inc.index else 0
-                    year_data['grossProfit'] = float(inc.loc['Gross Profit', col]) if 'Gross Profit' in inc.index else 0
-                    year_data['operatingIncome'] = float(inc.loc['Operating Income', col]) if 'Operating Income' in inc.index else 0
-                    year_data['netIncome'] = float(inc.loc['Net Income', col]) if 'Net Income' in inc.index else 0
-                    year_data['ebitda'] = float(inc.loc['EBITDA', col]) if 'EBITDA' in inc.index else 0
+                    
+                    # Función auxiliar para buscar el primer KEY que exista
+                    def get_f(df, keys, c):
+                        for k in keys:
+                            if k in df.index: return float(df.loc[k, c])
+                        return 0.0
+
+                    year_data['totalRevenue'] = get_f(inc, map_inc['revenue'], col)
+                    year_data['grossProfit'] = get_f(inc, map_inc['gross'], col)
+                    year_data['operatingIncome'] = get_f(inc, map_inc['op_inc'], col)
+                    year_data['netIncome'] = get_f(inc, map_inc['net'], col)
+                    year_data['ebitda'] = get_f(inc, map_inc['ebitda'], col)
                     income_history.append(year_data)
         except:
             pass
@@ -580,11 +609,16 @@ def get_deep_financials(ticker):
             bs = t.balance_sheet
             if bs is not None and not bs.empty:
                 latest = bs.iloc[:, 0]
-                balance_data['totalAssets'] = float(latest.get('Total Assets', 0))
-                balance_data['totalLiabilities'] = float(latest.get('Total Liabilities Net Minority Interest', latest.get('Total Debt', 0)))
-                balance_data['totalEquity'] = float(latest.get('Stockholders Equity', latest.get('Total Equity Gross Minority Interest', 0)))
-                balance_data['cash'] = float(latest.get('Cash And Cash Equivalents', 0))
-                balance_data['totalDebt'] = float(latest.get('Total Debt', 0))
+                def get_bs(s, keys):
+                    for k in keys:
+                        if k in s.index: return float(s[k])
+                    return 0.0
+                
+                balance_data['totalAssets'] = get_bs(latest, ['Total Assets', 'Total Assets As Reported'])
+                balance_data['totalLiabilities'] = get_bs(latest, ['Total Liabilities Net Minority Interest', 'Total Liabilities As Reported', 'Total Debt'])
+                balance_data['totalEquity'] = get_bs(latest, ['Stockholders Equity', 'Total Equity Gross Minority Interest', 'Common Stock Equity'])
+                balance_data['cash'] = get_bs(latest, ['Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments'])
+                balance_data['totalDebt'] = get_bs(latest, ['Total Debt', 'Long Term Debt'])
         except:
             pass
  
@@ -594,11 +628,18 @@ def get_deep_financials(ticker):
             cf = t.cashflow
             if cf is not None and not cf.empty:
                 latest = cf.iloc[:, 0]
-                cashflow_data['operatingCashflow'] = float(latest.get('Operating Cash Flow', latest.get('Total Cash From Operating Activities', 0)))
-                cashflow_data['capitalExpenditure'] = float(latest.get('Capital Expenditure', 0))
-                cashflow_data['freeCashflow'] = cashflow_data['operatingCashflow'] + cashflow_data['capitalExpenditure']
-                cashflow_data['dividendsPaid'] = float(latest.get('Common Stock Dividend Paid', latest.get('Cash Dividends Paid', 0)))
-                cashflow_data['shareRepurchase'] = float(latest.get('Repurchase Of Capital Stock', 0))
+                def get_cf(s, keys):
+                    for k in keys:
+                        if k in s.index: return float(s[k])
+                    return 0.0
+
+                cashflow_data['operatingCashflow'] = get_cf(latest, ['Operating Cash Flow', 'Total Cash From Operating Activities', 'Cash Flow From Continuing Operating Activities'])
+                # Capex suele ser negativo en yfinance
+                capex = get_cf(latest, ['Capital Expenditure', 'Purchase Of PPE', 'Net PPE Purchase And Sale'])
+                cashflow_data['capitalExpenditure'] = cax = float(capex)
+                cashflow_data['freeCashflow'] = cashflow_data['operatingCashflow'] + cax # Suma porque capex suele ser negativo
+                cashflow_data['dividendsPaid'] = get_cf(latest, ['Common Stock Dividend Paid', 'Cash Dividends Paid'])
+                cashflow_data['shareRepurchase'] = get_cf(latest, ['Repurchase Of Capital Stock'])
         except:
             pass
         
@@ -1038,7 +1079,8 @@ Basándote en los targets de analistas y la estructura técnica, estima el poten
 - **Take Profit Sugerido**
 
 REGLAS:
-- Escribe con datos y argumentos, no con opiniones vagas.
+- ZERO HALLUCINATION: No inventes datos. Cíñete estrictamente a las métricas proporcionadas.
+- Escribe con argumentos cuantitativos, no con opiniones vagas.
 - Máximo 600 palabras.
 - No uses el símbolo '$' pegado a los números (usa USD o solo el número).
 - No uses formato LaTeX.
@@ -1051,7 +1093,7 @@ REGLAS:
         payload = {
             "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
+            "temperature": 0.1,
             "max_tokens": 2000
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
@@ -1170,7 +1212,7 @@ def get_alpha_pilot_response(api_key, user_input, chat_history):
                 "description": "Obtiene noticias en tiempo real para un ticker o mercado general.",
                 "parameters": {
                     "type": "object",
-                    "properties": { "ticker": {"type": "string", "description": "Ticker (ej: AAPL) o ^GSPC"} },
+                    "properties": { "ticker": {"type": "string", "description": "Ticker (ej: AAPL, NVDA) o índices (^GSPC, ^IXIC, XLK para tecnología)"} },
                     "required": ["ticker"]
                 }
             }
@@ -1204,49 +1246,74 @@ def get_alpha_pilot_response(api_key, user_input, chat_history):
 
     FILOSOFÍA:
     - Eres un experto en mercados financieros, con un tono profesional, analítico y directo.
-    - Esta es una plataforma institucional para inversores estratégicos de corto y mediano plazo.
+    - Esta es una plataforma institucional para inversores estratégicos.
 
     REGLAS DE OPERACIÓN:
-    1. HERRAMIENTAS: Tienes acceso a herramientas para datos en tiempo real. ÚSALAS siempre que el usuario pregunte por precios, noticias, rendimientos o calendario.
-    2. RENDIMIENTOS HISTÓRICOS: Si preguntan por rendimiento de 1 año o periodos largos, usa 'get_deep_technical_analysis'.
-    3. NO MENCIONAR SINTAXIS: Nunca muestres al usuario el nombre de la función ni su sintaxis (ej: no escribas <function=...>); simplemente reporta los datos obtenidos.
-    4. ZERO HALLUCINATION: Si no tienes datos o una herramienta no devuelve lo que buscas, admítelo. No inventes precios ni fechas.
+    1. HERRAMIENTAS: ÚSALAS siempre que el usuario pregunte por precios, noticias, rendimientos o calendario.
+    2. SECTORES: Para Tecnología usa XLK o ^IXIC. Para el mercado general usa ^GSPC.
+    3. ZERO HALLUCINATION: No inventes precios. Si una herramienta no devuelve datos, admítelo.
+    4. NO MENCIONAR SINTAXIS: Reporta los resultados, no nombres de funciones.
     5. IDIOMA: Responde exclusivamente en ESPAÑOL.
     """
     
-    # Filtrar historial de chat para solo enviar contenido de texto a Groq (evita errores de esquema)
+    # 2. Limpieza Robusta del Historial (Evita Error 400 y Error 429)
+    # Filtramos SOLO mensajes con contenido de texto (eliminamos tool_calls técnicos del historial pasado)
     clean_history = []
-    for msg in chat_history[-8:]:
-        if isinstance(msg, dict) and 'content' in msg:
-            # Solo enviamos mensajes de usuario y asistente con contenido de texto simple
-            if msg['role'] in ['user', 'assistant']:
-                clean_history.append({"role": msg['role'], "content": msg['content']})
-
-    messages = [{"role": "system", "content": system_prompt}] + clean_history + [{"role": "user", "content": user_input}]
+    for msg in chat_history:
+        if not isinstance(msg, dict): continue
+        role = msg.get('role')
+        content = msg.get('content')
+        
+        # Solo conservamos mensajes con texto real para evitar romper el esquema de la API
+        if role in ['user', 'assistant'] and content and isinstance(content, str):
+            # No enviar errores técnicos al modelo
+            if "AlphaPilot offline" in content or "Tuve un problema procesando" in content:
+                continue
+            clean_history.append({"role": role, "content": content})
+            
+    # Reducimos la ventana de memoria a los últimos 5 mensajes para ahorrar tokens (Evita Error 429)
+    messages = [{"role": "system", "content": system_prompt}] + clean_history[-5:] + [{"role": "user", "content": user_input}]
     
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     
+    # Modelo sugerido para mayor velocidad y límites: llama-3.1-8b-instant
+    # Modelo sugerido para alta inteligencia: llama-3.3-70b-versatile (pero tiene límites bajos)
+    MODEL_ID = "llama-3.1-8b-instant" 
+
     try:
-        # Primera llamada para ver si necesita herramientas
+        # Llamada inicial
         payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model": MODEL_ID,
             "messages": messages,
             "tools": tools,
             "tool_choice": "auto",
-            "temperature": 0.2
+            "temperature": 0.1
         }
         
-        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
+        
+        if resp.status_code == 429:
+            return "⚠️ El motor de IA (Groq) ha alcanzado su límite de velocidad temporal. Por favor, reintenta en 10-20 segundos."
+        
         if resp.status_code != 200:
-            return f"AlphaPilot offline (Error {resp.status_code}). Intenta simplificar tu consulta."
+            # Si el modelo instant falla, intentamos una vez más con un modelo alternativo robusto
+            alternativo = "llama3-70b-8192"
+            payload["model"] = alternativo
+            resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=25)
+            if resp.status_code != 200:
+                return f"AlphaPilot está saturado (Error {resp.status_code}). Prueba con una pregunta más corta."
             
         resp_data = resp.json()
         message = resp_data['choices'][0]['message']
         
-        # 2. Manejo de Tool Calls
+        # 3. Manejo de Tool Calls
         if 'tool_calls' in message and message['tool_calls']:
-            # Añadir respuesta del asistente que pide las herramientas
-            messages.append(message)
+            assistant_msg = {
+                "role": "assistant",
+                "tool_calls": message['tool_calls'],
+                "content": message.get('content') or ""
+            }
+            messages.append(assistant_msg)
             
             for tool_call in message['tool_calls']:
                 func_name = tool_call['function']['name']
@@ -1255,49 +1322,35 @@ def get_alpha_pilot_response(api_key, user_input, chat_history):
                 except:
                     args = {}
                 
-                # Ejecutar función real
                 result_str = ""
                 if func_name == "get_platform_info":
                     result_str = get_platform_info()
-                
                 elif func_name == "get_ticker_snapshot":
                     t = args.get('ticker', '').upper()
                     snap = get_ticker_snapshot(t)
                     result_str = json.dumps(snap) if isinstance(snap, dict) else str(snap)
-
                 elif func_name == "get_deep_technical_analysis":
                     t = args.get('ticker', '').upper()
                     tech = get_deep_technical_analysis(t)
                     if tech:
-                        # Resumen legible para la IA
-                        result_str = (f"Análisis Técnico {t}:\n"
-                                     f"- Precio: ${tech['price']:.2f}\n"
-                                     f"- Rendimientos: 1D: {tech['chg_1d']:.2f}%, 1M: {tech['chg_1m']:.2f}%, 6M: {tech['chg_6m']:.2f}%, 1Y: {tech['chg_1y']:.2f}%\n"
-                                     f"- RSI: {tech['rsi']:.1f}, Tendencia: {tech['trend_status']}, Weinstein: {tech['weinstein']}")
-                    else:
-                        result_str = f"No se pudo obtener el análisis técnico profundo para {t}."
-
+                        result_str = (f"Técnico {t}: ${tech['price']:.2f}, RSI: {tech['rsi']:.1f}, "
+                                     f"1Y Chg: {tech['chg_1y']:.2f}%, Trend: {tech['trend_status']}")
+                    else: result_str = f"Error obteniendo análisis para {t}"
                 elif func_name == "get_economic_calendar":
                     d_str = args.get('date_str') or dt.now().strftime('%Y-%m-%d')
-                    d_count = max(int(args.get('days') or 7), 1)
-                    df_cal = get_economic_calendar(date_str=d_str, days=d_count)
-                    if not df_cal.empty and 'Error' not in df_cal.columns:
-                        rows = [f"- [{r['Fecha']}] {r['Hora']} - {r['Evento']} (Act: {r['Actual']}, Prev: {r['Previsto']})" for _, r in df_cal.iterrows()]
-                        result_str = "\n".join(rows)
-                    else:
-                        result_str = "No hay eventos económicos relevantes."
-                
+                    df_cal = get_economic_calendar(date_str=d_str, days=int(args.get('days', 7)))
+                    result_str = df_cal.to_string() if not df_cal.empty else "No hay eventos."
                 elif func_name == "get_market_news":
                     ticker = args.get('ticker', '^GSPC').upper()
-                    result_str = f"NOTICIAS PARA {ticker}:\n" + get_market_news(ticker)
-                
+                    # Mapeo inteligente para sectores si el usuario pregunta genérico
+                    if "TECNOLOG" in ticker or "TECH" in ticker: ticker = "XLK"
+                    elif "NASD" in ticker: ticker = "^IXIC"
+                    result_str = get_market_news(ticker)
                 elif func_name == "get_wheel_portfolio_details":
                     result_str = get_wheel_portfolio_details()
-                
                 elif func_name == "get_user_journal":
                     result_str = get_user_journal()
                 
-                # Enviar resultado de vuelta
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call['id'],
@@ -1305,17 +1358,17 @@ def get_alpha_pilot_response(api_key, user_input, chat_history):
                     "content": result_str
                 })
             
-            # Segunda llamada con los resultados de las herramientas
+            # Segunda llamada final
             final_payload = {
-                "model": "llama-3.3-70b-versatile",
+                "model": MODEL_ID,
                 "messages": messages,
-                "temperature": 0.2
+                "temperature": 0.1
             }
-            final_resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=final_payload, timeout=30)
+            final_resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=final_payload, timeout=25)
             if final_resp.status_code == 200:
                 return final_resp.json()['choices'][0]['message']['content']
             else:
-                return "Tuve un problema procesando los datos técnicos. ¿Podrías repetirme la pregunta?"
+                return "AlphaPilot procesó los datos pero el servidor de respuesta está ocupado. Intenta de nuevo."
         
         return message.get('content', "No pude procesar esa solicitud.")
 
@@ -1363,6 +1416,11 @@ def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
     3. SALUD FINANCIERA: ¿Son empresas robustas para mantener en caso de asignación?
     4. VERDICTO ESTRATÉGICO: Asigna una calificación del 1 al 10 al riesgo y da un veredicto formal.
     
+    REGLAS CRÍTICAS (ZERO HALLUCINATION):
+    - No inventes precios ni datos financieros. 
+    - Basa tus conclusiones ÚNICAMENTE en los números proporcionados arriba.
+    - Si falta algún dato para una conclusión, menciónalo en lugar de suponerlo.
+    
     Responde en Español, con un tono profesional y directo. Usa Markdown.
     """
     
@@ -1371,151 +1429,26 @@ def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
         payload = {
             "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.4,
+            "temperature": 0.1,
             "max_tokens": 1500
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
             return resp.json()['choices'][0]['message']['content']
-        return "Error en la comunicación con la IA."
+        return f"Error en la comunicación con la IA (Status {resp.status_code})."
     except Exception as e:
         return f"Error: {e}"
 
 
-def calculate_delta(S, K, T, r, sigma, option_type='put'):
+# --- UTILIDADES DE OPCIONES ---
+def calculate_delta(S, K, T, r, sigma, option_type='call'):
     """Calcula el Delta de una opción usando Black-Scholes."""
-    if T <= 0 or sigma <= 0:
-        return 0
+    if sigma <= 0 or T <= 0: return 0
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
     if option_type == 'call':
         return norm.cdf(d1)
     else:
         return norm.cdf(d1) - 1
-
-def get_wheel_recommendations(budget, max_price_filter=None):
-    """
-    Busca las mejores acciones para iniciar 'La Rueda' (Cash Secured Puts).
-    Filtra por capital, Salud Financiera y Etapa de Weinstein.
-    """
-    results = []
-    # Usamos un subconjunto representativo para no saturar
-    WHEEL_UNIVERSE = SCANNER_UNIVERSE 
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    total = len(WHEEL_UNIVERSE)
-    
-    # Tasa libre de riesgo (aproximada 4.5% para el cálculo de Delta)
-    r = 0.045
-    
-    for i, ticker in enumerate(WHEEL_UNIVERSE):
-        # progress_bar.progress((i + 1) / total)
-        # status_text.caption(f"Analizando {ticker} para Ciclo de Rueda... ({i+1}/{total})")
-        # Esta parte ya no se usa secuencialmente, se reemplaza por el ThreadPoolExecutor de abajo
-        pass
-        
-        try:
-            t = yf.Ticker(ticker)
-            # Primero filtro rápido por precio
-            fast_info = t.fast_info
-            curr_price = fast_info.get('last_price', 0)
-            
-            if curr_price == 0: continue
-            the_max_p = max_price_filter if max_price_filter else (budget / 100)
-            if curr_price > the_max_p:
-                continue
-                
-            # Filtro por Weinstein (necesitamos historial)
-            hist = t.history(period='1y', interval='1d', auto_adjust=True)
-            w_stage = get_weinstein_stage(hist)
-            
-            # Solo Etapas de Acumulación (1) o Tendencia Alcista (2)
-            if "1" not in str(w_stage) and "2" not in str(w_stage):
-                continue
-                
-            # Filtro por Salud Financiera (Necesitamos financials)
-            fin_data = get_deep_financials(ticker)
-            health = calculate_financial_health_score(fin_data)
-            
-            if health['total'] < 65: # Un poco más flexible para el escáner inicial
-                continue
-                
-            # --- BÚSQUEDA DE OPCIÓN (CASH SECURED PUT) ---
-            expirations = t.options
-            if not expirations: continue
-            
-            # Buscamos vencimiento entre 25 y 50 días
-            target_date = None
-            today = dt.now()
-            for exp in expirations:
-                exp_dt = dt.strptime(exp, '%Y-%m-%d')
-                days_to_exp = (exp_dt - today).days
-                if 25 <= days_to_exp <= 55:
-                    target_date = exp
-                    T = days_to_exp / 365.0
-                    break
-            
-            if not target_date: continue
-            
-            opts = t.option_chain(target_date)
-            puts = opts.puts
-            
-            # Buscamos el strike que tenga un Delta cercano a -0.30
-            # Como no tenemos el Delta directo del API filtrado, lo calculamos
-            best_put = None
-            min_delta_diff = float('inf')
-            
-            for index, put in puts.iterrows():
-                strike = put['strike']
-                iv = put['impliedVolatility']
-                
-                # Omitir strikes muy ITM o sin liquidez
-                if strike >= curr_price or iv < 0.01: continue
-                
-                calc_d = calculate_delta(curr_price, strike, T, r, iv, 'put')
-                
-                # Buscamos el que esté más cerca de Delta -0.30
-                diff = abs(calc_d - (-0.30))
-                if diff < min_delta_diff:
-                    min_delta_diff = diff
-                    best_put = put
-                    best_put['delta'] = calc_d
-            
-            if best_put is not None:
-                premium = (best_put['bid'] + best_put['ask']) / 2
-                if premium <= 0: premium = best_put['lastPrice']
-                
-                # Retorno de la operación (Yield)
-                # Strike * 100 es el colateral
-                collateral = best_put['strike'] * 100
-                yield_pct = (premium * 100 / collateral) * 100
-                
-                # Anualizado
-                days_to_exp = (dt.strptime(target_date, '%Y-%m-%d') - today).days
-                annualized = (yield_pct / days_to_exp) * 365
-                
-                results.append({
-                    'Ticker': ticker,
-                    'Sector': fin_data['general'].get('sector', 'N/D'),
-                    'Precio': round(curr_price, 2),
-                    'W Stage': w_stage,
-                    'Salud': f"{health['total']}/100",
-                    'Strike': best_put['strike'],
-                    'Delta': round(best_put['delta'], 2),
-                    'Prima': round(premium, 2),
-                    'Capital Requerido': collateral,
-                    'Retorno': f"{yield_pct:.2f}%",
-                    'Anualizado': f"{annualized:.1f}%",
-                    'Vencimiento': target_date
-                })
-                
-        except Exception as e:
-            print(f"Error analizando {ticker} para el ciclo de rueda: {e}")
-            
-    progress_bar.empty()
-    status_text.empty()
-    return pd.DataFrame(results)
 
 # --- MOMENTUM SCANNER ---
 SCANNER_UNIVERSE = [
@@ -1543,54 +1476,34 @@ SCANNER_UNIVERSE = [
 
 # Añadir más S&P 500 para llegar a ~260 (Top de Market Cap adicional)
 ADDITIONAL_UNIVERSE = [
-    'T', 'VZ', 'TMUS', 'DIS', 'CMCSA', 'CHTR', 'NFLX', 'SNE', 'PARA', 'WBD',
+    'T', 'VZ', 'TMUS', 'DIS', 'CMCSA', 'CHTR', 'NFLX', 'SONY', 'PARA', 'WBD',
     'ADP', 'PAYX', 'FIS', 'FISV', 'GPN', 'INTU', 'ADSK', 'ANSS', 'TEAM', 'ZM',
     'SYK', 'BSX', 'EW', 'ZTS', 'IDXX', 'ALGN', 'A', 'STZ', 'BF-B', 'KDP', 'MDLZ',
     'K', 'GIS', 'CPB', 'SJM', 'HSY', 'ADM', 'TSN', 'KHC', 'SYY', 'TFC', 'USB', 'PNC', 
     'TROW', 'MET', 'PRU', 'AIG', 'TRV', 'CB', 'CME', 'ICE', 'ETN', 'ITW', 'EMR',
     'WM', 'RSG', 'NSC', 'UNP', 'CSX', 'ODFL', 'MAR', 'EXPE', 'CCL', 'RCL', 'NCLH',
-    'DHR', 'A', 'TMO', 'WAT', 'VTRS', 'HCA', 'HUM', 'CI', 'CVS', 'CNC', 'MCK', 'ABC',
-    'EOG', 'PXD', 'MPC', 'PSX', 'VLO', 'HES', 'DVN', 'FANG', 'O', 'AMT', 'CCI', 'PLD',
+    'DHR', 'A', 'TMO', 'WAT', 'VTRS', 'HCA', 'HUM', 'CI', 'CVS', 'CNC', 'MCK', 'COR',
+    'EOG', 'MPC', 'PSX', 'VLO', 'DVN', 'FANG', 'O', 'AMT', 'CCI', 'PLD',
     'EQIX', 'PSA', 'DLR', 'VICI', 'WY', 'SPG', 'AVB', 'EQR'
 ]
 
 SCANNER_UNIVERSE = sorted(list(set(SCANNER_UNIVERSE + ADDITIONAL_UNIVERSE)))
 
-def analyze_single_ticker_wheel(ticker, budget, max_price_filter, r=0.045):
-    """Función auxiliar para procesar un solo ticker en paralelo."""
+def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045):
+    """Procesa un solo ticker para el ciclo de la Rueda usando datos pre-filtrados."""
     try:
-        t = yf.Ticker(ticker)
-        # Intentar obtener precio rápido
-        fast_info = t.fast_info
-        curr_price = fast_info.get('last_price', 0) if hasattr(fast_info, 'get') else 0
+        if hist is None or hist.empty: return None
+        curr_price = float(hist['Close'].iloc[-1])
         
-        # Obtener historial para Weinstein y como fallback de precio
-        hist = t.history(period='1y', interval='1d', auto_adjust=True)
-        if hist.empty or len(hist) < 150:
-            return None
-            
-        if curr_price == 0:
-            curr_price = hist['Close'].iloc[-1]
-            
-        if curr_price == 0: return None
-        
-        # Filtros de precio: Siempre escaneamos hasta $500 para llenar la base de datos
-        # El filtrado específico se hace después en la UI
-        if curr_price > 500:
-            return None
-            
+        # Weinstein (ya filtrado pero re-calculamos para mostrarlo)
         w_stage = get_weinstein_stage(hist)
-        # Permitir Etapa 1, 2 y Transición
-        if "1" not in str(w_stage) and "2" not in str(w_stage) and "Transición" not in str(w_stage):
-            return None
             
         fin_data = get_deep_financials(ticker)
         health = calculate_financial_health_score(fin_data)
         if health['total'] < 50:
             return None
             
-        print(f"DEBUG Wheel: {ticker} pasó filtros iniciales. Analizando opciones...")
-            
+        t = yf.Ticker(ticker)
         expirations = t.options
         if not expirations: return None
         
@@ -1600,13 +1513,11 @@ def analyze_single_ticker_wheel(ticker, budget, max_price_filter, r=0.045):
             try:
                 exp_dt = dt.strptime(exp, '%Y-%m-%d')
                 days_to_exp = (exp_dt - today).days
-                # Rango de 15 a 70 días para ser más flexible
-                if 15 <= days_to_exp <= 70:
+                if 25 <= days_to_exp <= 55: # Rueda estándar 30-45 dte
                     target_date = exp
                     T = days_to_exp / 365.0
                     break
-            except:
-                continue
+            except: continue
         
         if not target_date: return None
         
@@ -1615,12 +1526,10 @@ def analyze_single_ticker_wheel(ticker, budget, max_price_filter, r=0.045):
         
         best_put = None
         min_delta_diff = float('inf')
-        
-        for index, put in puts.iterrows():
+        for _, put in puts.iterrows():
             strike = put['strike']
             iv = put['impliedVolatility']
             if strike >= curr_price or iv < 0.01: continue
-            
             calc_d = calculate_delta(curr_price, strike, T, r, iv, 'put')
             diff = abs(calc_d - (-0.30))
             if diff < min_delta_diff:
@@ -1631,7 +1540,6 @@ def analyze_single_ticker_wheel(ticker, budget, max_price_filter, r=0.045):
         if best_put is not None:
             premium = (best_put['bid'] + best_put['ask']) / 2
             if premium <= 0: premium = best_put['lastPrice']
-            
             collateral = best_put['strike'] * 100
             yield_pct = (premium * 100 / collateral) * 100
             days_to_exp = (dt.strptime(target_date, '%Y-%m-%d') - today).days
@@ -1654,53 +1562,77 @@ def analyze_single_ticker_wheel(ticker, budget, max_price_filter, r=0.045):
                 'Vencimiento': target_date
             }
     except Exception as e:
-        print(f"ERROR Wheel {ticker}: {e}")
+        print(f"Error Wheel {ticker}: {e}")
     return None
 
 def get_wheel_recommendations(budget, max_price_filter=None):
     """
-    Busca las mejores acciones para iniciar 'La Rueda' (Cash Secured Puts).
-    USA MULTITHREADING para procesar ~250 activos rápidamente.
+    Busca mejores acciones para 'The Wheel' usando Bulk Download + Parallel Processing.
+    Optimizado para evitar rate-limits de Yahoo Finance.
     """
     results = []
     WHEEL_UNIVERSE = SCANNER_UNIVERSE 
     
+    with st.spinner(f"🚀 Pre-escaneando {len(WHEEL_UNIVERSE)} activos..."):
+        try:
+            # Descarga masiva para filtros rápidos (Weinstein + Precio)
+            data = yf.download(WHEEL_UNIVERSE, period='1y', group_by='ticker', progress=False, auto_adjust=True)
+        except:
+            return pd.DataFrame()
+
+    if data.empty: return pd.DataFrame()
+
+    survivors = []
+    the_max_p = max_price_filter if max_price_filter else (budget / 100)
+    
+    for ticker in WHEEL_UNIVERSE:
+        try:
+            if ticker in data.columns.get_level_values(0):
+                hist = data[ticker].dropna()
+                if hist.empty or len(hist) < 150: continue
+                
+                curr_price = float(hist['Close'].iloc[-1])
+                if curr_price > the_max_p: continue
+                
+                w_stage = get_weinstein_stage(hist)
+                # Solo Etapa 1 o 2 (Acumulación o Tendencia)
+                if "1" not in str(w_stage) and "2" not in str(w_stage): continue
+                
+                survivors.append((ticker, hist))
+        except: continue
+
+    if not survivors:
+        return pd.DataFrame()
+
     progress_bar = st.progress(0)
     status_text = st.empty()
-    total = len(WHEEL_UNIVERSE)
+    total = len(survivors)
     
-    # Procesamiento en paralelo (12 hilos)
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        futures = {executor.submit(analyze_single_ticker_wheel, ticker, budget, max_price_filter): ticker for ticker in WHEEL_UNIVERSE}
-        
+    # Solo procesamos los sobrevivientes en paralelo (Llamadas caras de Opciones/Financials)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(analyze_single_ticker_wheel, t, h, budget, max_price_filter): t for t, h in survivors}
         for i, future in enumerate(futures):
             ticker = futures[future]
             res = future.result()
-            if res:
-                results.append(res)
-            
+            if res: results.append(res)
             progress_bar.progress((i + 1) / total)
-            status_text.caption(f"Procesando {ticker}... ({i+1}/{total})")
+            status_text.caption(f"Calculando opciones de {ticker}... ({i+1}/{total})")
             
     progress_bar.empty()
     status_text.empty()
     return pd.DataFrame(results)
 
-
-def analyze_single_ticker_momentum(ticker, price_min, price_max, min_volume, smooth_momentum=False):
-    """Procesa un solo ticker para el escáner de momentum."""
+def analyze_single_ticker_momentum(ticker, hist, price_min, price_max, min_volume, smooth_momentum=False):
+    """Procesa un solo ticker para el escáner de momentum usando datos pre-cargados."""
     try:
-        t = yf.Ticker(ticker)
-        # 1y para Weinstein (SMA 150)
-        hist = t.history(period='1y', interval='1d', auto_adjust=True)
-        if hist.empty or len(hist) < 20:
+        if hist is None or hist.empty or len(hist) < 20:
             return None
         
-        # Aplanar si es MultiIndex
+        # Aplanar si es MultiIndex (aunque yf.download maneja esto, por seguridad)
         if isinstance(hist.columns, pd.MultiIndex):
             hist.columns = hist.columns.get_level_values(0)
 
-        price = hist['Close'].iloc[-1]
+        price = float(hist['Close'].iloc[-1])
         # Filtro de precio
         if price < price_min or price > price_max:
             return None
@@ -1710,7 +1642,7 @@ def analyze_single_ticker_momentum(ticker, price_min, price_max, min_volume, smo
         if avg_vol < min_volume:
             return None
         
-        # Calcular etapa de Weinstein
+        # Calcular etapa de Weinstein (Aproximación local para velocidad)
         w_stage = get_weinstein_stage(hist)
 
         # Calcular indicadores técnicos
@@ -1722,7 +1654,8 @@ def analyze_single_ticker_momentum(ticker, price_min, price_max, min_volume, smo
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss.replace(0, np.nan)
-        rsi = (100 - (100 / (1 + rs))).iloc[-1]
+        rsi_series = (100 - (100 / (1 + rs)))
+        rsi = rsi_series.iloc[-1] if not rsi_series.empty else 50
         
         # Cambios porcentuales
         chg_1d = ((price / hist['Close'].iloc[-2]) - 1) * 100 if len(hist) > 1 else 0
@@ -1748,58 +1681,67 @@ def analyze_single_ticker_momentum(ticker, price_min, price_max, min_volume, smo
         # Cambio 5d positivo (+20)
         if chg_5d > 0: score += 20
         # Volumen superior al promedio (+20)
-        if vol_ratio > 1.0: score += 20
+        if vol_ratio > 1.1: score += 20 # Un poco más estricto con el volumen en bulk
         
-        # --- FILTRO DE MOMENTUM SUAVE (Baja Volatilidad) ---
+        # --- FILTRO DE MOMENTUM SUAVE ---
         if smooth_momentum:
             # Si la volatilidad diaria es baja (< 2%), premiamos la estabilidad
             if daily_vol < 0.02: 
                 score += 20
             # Si es muy alta (> 4%), penalizamos fuertemente
             elif daily_vol > 0.04:
-                score -= 40
-
-        # Solo incluir si tiene mínimo 40 de score
-        if score >= 40:
-            return {
-                'Ticker': ticker,
-                'Precio': round(price, 2),
-                'Etapa W': w_stage,
-                '1D%': round(chg_1d, 2),
-                '5D%': round(chg_5d, 2),
-                '20D%': round(chg_20d, 2),
-                'RSI': round(rsi, 1),
-                'Vol Ratio': round(vol_ratio, 2),
-                'Vol Avg': f"{avg_vol/1e6:.1f}M",
-                'Score': score
-            }
-    except Exception:
-        pass
-    return None
+                score -= 20
+        
+        return {
+            'Ticker': ticker,
+            'Precio': round(price, 2),
+            'Score': score,
+            'Etapa W': w_stage,
+            '1D%': round(chg_1d, 2),
+            '5D%': round(chg_5d, 2),
+            '20D%': round(chg_20d, 2),
+            'Vol_Ratio': round(vol_ratio, 2)
+        }
+    except:
+        return None
 
 @st.cache_data(ttl=900, show_spinner=False)
 def scan_momentum_stocks(price_min, price_max, min_volume, smooth_momentum=False):
-    """Escanea el universo de acciones buscando momentum alcista usando Multithreading."""
+    """Escanea el universo usando descargas masivas (Bulk) para máxima velocidad y seguridad."""
     results = []
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    total = len(SCANNER_UNIVERSE)
     
-    # Procesamiento en paralelo (15 hilos)
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        futures = {executor.submit(analyze_single_ticker_momentum, ticker, price_min, price_max, min_volume, smooth_momentum): ticker for ticker in SCANNER_UNIVERSE}
-        
-        for i, future in enumerate(futures):
-            ticker = futures[future]
-            res = future.result()
-            if res:
-                results.append(res)
+    with st.spinner(f"🚀 Descargando datos de {len(SCANNER_UNIVERSE)} activos..."):
+        try:
+            # Descargar TODO el universo en una sola petición (Ahorra ~250 peticiones)
+            # Usamos 1y para tener suficiente historial para SMA 150 (Weinstein)
+            data = yf.download(SCANNER_UNIVERSE, period='1y', interval='1d', group_by='ticker', progress=False, auto_adjust=True)
+        except Exception as e:
+            st.error(f"Error en descarga masiva: {e}")
+            return pd.DataFrame()
+
+    if data.empty:
+        return pd.DataFrame()
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Procesar cada ticker del dataframe masivo
+    for i, ticker in enumerate(SCANNER_UNIVERSE):
+        try:
+            # Extraer el historial de este ticker específico del gran DataFrame
+            if ticker in data.columns.get_level_values(0):
+                hist = data[ticker].dropna()
+                res = analyze_single_ticker_momentum(ticker, hist, price_min, price_max, min_volume, smooth_momentum)
+                if res:
+                    results.append(res)
+        except:
+            continue
             
-            progress_bar.progress((i + 1) / total)
-            progress_text.caption(f"Escaneando {ticker}... ({i+1}/{total})")
-            
+        progress_bar.progress((i + 1) / len(SCANNER_UNIVERSE))
+        status_text.caption(f"Analizando {ticker}...")
+
     progress_bar.empty()
-    progress_text.empty()
+    status_text.empty()
     
     if results:
         df = pd.DataFrame(results).sort_values('Score', ascending=False).reset_index(drop=True)
@@ -1907,7 +1849,7 @@ IMPORTANTE:
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model": "llama-3.1-8b-instant",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.3,
             "max_tokens": 600
@@ -1950,7 +1892,7 @@ def get_pre_market_briefing(api_key, context_data, news_text, calendar_text=""):
     """
     
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.6
     }
@@ -2028,6 +1970,20 @@ class MarketDB:
                     last_updated TEXT
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS scanner_cache (
+                    ticker TEXT PRIMARY KEY,
+                    price REAL,
+                    score INTEGER,
+                    etapa_w TEXT,
+                    chg_1d REAL,
+                    chg_5d REAL,
+                    chg_20d REAL,
+                    vol_ratio REAL,
+                    sector TEXT,
+                    last_updated TEXT
+                )
+            ''')
             conn.commit()
             conn.close()
         except Error as e:
@@ -2076,6 +2032,57 @@ class MarketDB:
             return df
         except:
             return pd.DataFrame()
+
+    def save_scanner_results(self, df):
+        """Guarda los resultados del Momentum Scanner en la base de datos."""
+        if df.empty: return
+        try:
+            conn = sqlite3.connect(self.db_file)
+            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            # Limpiar tabla antes de insertar (reemplazo completo)
+            conn.execute('DELETE FROM scanner_cache')
+            for _, row in df.iterrows():
+                conn.execute('''
+                    INSERT OR REPLACE INTO scanner_cache 
+                    (ticker, price, score, etapa_w, chg_1d, chg_5d, chg_20d, vol_ratio, sector, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    row['Ticker'], row['Precio'], row['Score'], row.get('Etapa W', 'N/D'),
+                    row.get('1D%', 0), row.get('5D%', 0), row.get('20D%', 0),
+                    row.get('Vol_Ratio', 0), row.get('Sector', 'N/D'), now
+                ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving scanner cache: {e}")
+
+    def get_scanner_cache(self):
+        """Carga los resultados del último escaneo desde la base de datos."""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            df = pd.read_sql_query("SELECT * FROM scanner_cache ORDER BY score DESC", conn)
+            conn.close()
+            if not df.empty:
+                df = df.rename(columns={
+                    'ticker': 'Ticker', 'price': 'Precio', 'score': 'Score',
+                    'etapa_w': 'Etapa W', 'chg_1d': '1D%', 'chg_5d': '5D%',
+                    'chg_20d': '20D%', 'vol_ratio': 'Vol_Ratio', 'sector': 'Sector',
+                    'last_updated': 'Última Actualización'
+                })
+            return df
+        except:
+            return pd.DataFrame()
+
+    def get_scanner_last_updated(self):
+        """Retorna la fecha del último escaneo guardado."""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.execute("SELECT last_updated FROM scanner_cache LIMIT 1")
+            row = cursor.fetchone()
+            conn.close()
+            return row[0] if row else None
+        except:
+            return None
 
     def get_last_date(self, ticker):
         conn = sqlite3.connect(self.db_file)
@@ -2204,283 +2211,29 @@ class MarketDB:
 
 market_db = MarketDB()
 
-# Cargar datos con múltiples fuentes
-@st.cache_data(show_spinner=False)
-def load_data(ticker, start_date, end_date):
-    """
-    Carga datos usando Yahoo Finance únicamente.
-    Versión Caché: 7.0 (Yahoo Only)
-    """
-    return load_data_with_yahoo(ticker, start_date, end_date)
-
-def load_data_with_alpha_vantage(ticker, start_date, end_date, api_key):
-    """
-    Carga datos usando Alpha Vantage API y sincroniza con la base de datos local.
-    """
-    s_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else str(start_date)
-    e_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date)
-
-    # Alpha Vantage sync logic removed - Yahoo Finance only
-    
-    if datos.empty: return None
-
-    try:
-        # Asegurar tipos numéricos y cálculo de indicadores
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required_cols:
-            datos[col] = pd.to_numeric(datos[col], errors='coerce')
-        
-        # Cálculo de Indicadores Relativos (Estacionarios)
-        datos['Returns'] = datos['Close'].pct_change()
-        if 'Returns' not in datos.columns:
-            raise KeyError("Returns")
-            
-        datos['MA20'] = datos['Close'].rolling(window=20).mean()
-        datos['MA50'] = datos['Close'].rolling(window=50).mean()
-        datos['MA200'] = datos['Close'].rolling(window=200).mean()
-        
-        datos['Dist_MA20'] = (datos['Close'] / datos['MA20']) - 1
-        datos['Dist_MA50'] = (datos['Close'] / datos['MA50']) - 1
-        datos['Dist_MA200'] = (datos['Close'] / datos['MA200']) - 1
-        
-        datos['RSI'] = calculate_rsi(datos['Close'])
-        datos['Volatility'] = datos['Returns'].rolling(window=20).std()
-        datos['Return_Lag1'] = datos['Returns'].shift(1)
-        
-        # MACD Relativo
-        exp1 = datos['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = datos['Close'].ewm(span=26, adjust=False).mean()
-        datos['MACD_Rel'] = (exp1 - exp2) / datos['Close']
-        
-        datos['MA20_BB'] = datos['Close'].rolling(window=20).mean()
-        datos['BB_Std'] = datos['Close'].rolling(window=20).std()
-        datos['BB_Pos'] = (datos['Close'] - (datos['MA20_BB'] - datos['BB_Std'] * 2)) / (datos['BB_Std'] * 4).replace(0, np.nan)
-
-        # NUEVAS VARIABLES: Volumen Relativo y Momentum 5d
-        datos['Volume_MA20'] = datos['Volume'].rolling(window=20).mean()
-        datos['Volume_Ratio'] = datos['Volume'] / datos['Volume_MA20']
-        datos['Momentum_5d'] = datos['Close'].pct_change(5)
-
-        # Mejoras de Inteligencia: ADX y ATR
-        datos['ADX'] = calculate_adx(datos)
-        datos['ATR'] = calculate_atr(datos)
-        datos['ATR_Rel'] = datos['ATR'] / datos['Close']
-
-        # ANÁLISIS INTERMARKET (Consistente con Yahoo)
-        try:
-
-            s_str_m = datos.index[0].strftime('%Y-%m-%d')
-            e_str_m = datos.index[-1].strftime('%Y-%m-%d')
-            
-            vix_data = yf.download("^VIX", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            tnx_data = yf.download("^TNX", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            gold_data = yf.download("GC=F", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            oil_data = yf.download("CL=F", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            nikkei_data = yf.download("^N225", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            dax_data = yf.download("^GDAXI", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            futures_data = yf.download("ES=F", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            dxy_data = yf.download("DX-Y.NYB", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            nya_data = yf.download("^NYA", start=s_str_m, end=e_str_m, progress=False, auto_adjust=False)
-            
-            for df_market in [vix_data, tnx_data, gold_data, oil_data, nikkei_data, dax_data, futures_data, dxy_data, nya_data]:
-                if isinstance(df_market.columns, pd.MultiIndex): df_market.columns = df_market.columns.get_level_values(0)
-            
-            datos['VIX_Change'] = vix_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Yield_Change'] = tnx_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Gold_Returns'] = gold_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Oil_Returns'] = oil_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Nikkei_Return'] = nikkei_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['DAX_Return'] = dax_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Futures_Return'] = futures_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['DXY_Return'] = dxy_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['NYA_Return'] = nya_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-        except Exception as e:
-            print(f"DEBUG: Error cargando variables Macro: {e}")
-            datos['VIX_Change'] = 0
-            datos['Yield_Change'] = 0
-            datos['Gold_Returns'] = 0
-            datos['Oil_Returns'] = 0
-            datos['Nikkei_Return'] = 0
-            datos['DAX_Return'] = 0
-            datos['Futures_Return'] = 0
-            datos['DXY_Return'] = 0
-            datos['NYA_Return'] = 0
-
-        datos['Target'] = (datos['Close'].shift(-1) > datos['Close']).astype(int)
-
-        # Limpiar valores infinitos y nulos
-        datos = datos.replace([np.inf, -np.inf], np.nan)
-        datos_final = datos.dropna().copy()
-        
-        return datos_final
-        
-    except Exception as e:
-        st.error(f"Error al procesar datos de Alpha Vantage: {str(e)}")
-        return None
+# --- UTILIDADES DE DATOS OBSOLETAS ---
+# (Removidas para optimizar el rendimiento y eliminar logs DEBUG)
         
 
-def load_data_with_yahoo(ticker, start_date, end_date, max_retries=3):
-    """
-    Carga datos usando la DB como caché local y Yahoo para sincronizar.
-    """
-    s_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else str(start_date)
-    e_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date)
-    
-    # 1. Intentar cargar lo que ya tenemos en DB
-    db_data = market_db.load_range(ticker, s_str, e_str)
-    
-    # 2. Verificar si hay "huecos" (especialmente el final para tener datos de hoy)
-    last_in_db = market_db.get_last_date(ticker)
-    today_str = dt.now().strftime('%Y-%m-%d')
-    
-    needs_update = False
-    fetch_start = s_str
-    
-    if last_in_db:
-        if last_in_db < today_str:
-            needs_update = True
-            fetch_start = last_in_db # Empezamos desde el último que tenemos
-    else:
-        needs_update = True
-
-    if needs_update:
-        for attempt in range(max_retries):
-            try:
-                print(f"DEBUG: Sincronizando {ticker} desde {fetch_start}...")
-                new_data = yf.download(ticker, start=fetch_start, progress=False, auto_adjust=False)
-                
-                if not new_data.empty:
-                    # Aplanar si es MultiIndex
-                    if isinstance(new_data.columns, pd.MultiIndex):
-                        new_data.columns = new_data.columns.get_level_values(0)
-                    
-                    market_db.save_data(new_data, ticker)
-
-                    break
-            except Exception as e:
-                print(f"Error sync: {e}")
-
-    # 3. Cargar el rango final completo desde la DB
-    datos = market_db.load_range(ticker, s_str, e_str)
-    
-    if datos.empty: 
-        st.error(f"No hay datos disponibles para {ticker} en el rango seleccionado.")
-        return None
-
-    try:
-        # Asegurar tipos numéricos
-        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required_cols:
-            datos[col] = pd.to_numeric(datos[col], errors='coerce')
-        
-        # Cálculo de Indicadores Relativos (Estacionarios)
-        datos['Returns'] = datos['Close'].pct_change()
-        if 'Returns' not in datos.columns:
-            print("DEBUG: ERROR CRÍTICO - 'Returns' no se pudo crear")
-            raise KeyError("Returns")
-            
-        datos['MA20'] = datos['Close'].rolling(window=20).mean()
-        datos['MA50'] = datos['Close'].rolling(window=50).mean()
-        datos['MA200'] = datos['Close'].rolling(window=200).mean()
-        
-        datos['Dist_MA20'] = (datos['Close'] / datos['MA20']) - 1
-        datos['Dist_MA50'] = (datos['Close'] / datos['MA50']) - 1
-        datos['Dist_MA200'] = (datos['Close'] / datos['MA200']) - 1
-        
-        datos['RSI'] = calculate_rsi(datos['Close'])
-        datos['Volatility'] = datos['Returns'].rolling(window=20).std()
-        datos['Return_Lag1'] = datos['Returns'].shift(1)
-        
-        # MACD Relativo
-        exp1 = datos['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = datos['Close'].ewm(span=26, adjust=False).mean()
-        datos['MACD_Rel'] = (exp1 - exp2) / datos['Close']
-        
-        # Bandas de Bollinger (Posición relativa)
-        datos['MA20_BB'] = datos['Close'].rolling(window=20).mean()
-        datos['BB_Std'] = datos['Close'].rolling(window=20).std()
-        datos['BB_Pos'] = (datos['Close'] - (datos['MA20_BB'] - datos['BB_Std'] * 2)) / (datos['BB_Std'] * 4).replace(0, np.nan)
-
-        # NUEVAS VARIABLES: Volumen Relativo y Momentum 5d
-        datos['Volume_MA20'] = datos['Volume'].rolling(window=20).mean()
-        datos['Volume_Ratio'] = datos['Volume'] / datos['Volume_MA20']
-        datos['Momentum_5d'] = datos['Close'].pct_change(5)
-
-        # Mejoras de Inteligencia: ADX y ATR
-        datos['ADX'] = calculate_adx(datos)
-        datos['ATR'] = calculate_atr(datos)
-        datos['ATR_Rel'] = datos['ATR'] / datos['Close']
-
-        # ANÁLISIS INTERMARKET (Oro + Petróleo + Macro)
-        try:
-
-            vix_data = yf.download("^VIX", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            tnx_data = yf.download("^TNX", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            gold_data = yf.download("GC=F", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            oil_data = yf.download("CL=F", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            nikkei_data = yf.download("^N225", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            dax_data = yf.download("^GDAXI", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            futures_data = yf.download("ES=F", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            dxy_data = yf.download("DX-Y.NYB", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            nya_data = yf.download("^NYA", start=s_str, end=e_str, progress=False, auto_adjust=False)
-            
-            for df_market in [vix_data, tnx_data, gold_data, oil_data, nikkei_data, dax_data, futures_data, dxy_data, nya_data]:
-                if isinstance(df_market.columns, pd.MultiIndex): df_market.columns = df_market.columns.get_level_values(0)
-            
-            datos['VIX_Change'] = vix_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Yield_Change'] = tnx_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Gold_Returns'] = gold_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Oil_Returns'] = oil_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Nikkei_Return'] = nikkei_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['DAX_Return'] = dax_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['Futures_Return'] = futures_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['DXY_Return'] = dxy_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-            datos['NYA_Return'] = nya_data['Close'].reindex(datos.index, method='ffill').pct_change().fillna(0)
-        except Exception as e:
-            print(f"DEBUG: Error cargando variables Macro: {e}")
-            datos['VIX_Change'] = 0
-            datos['Yield_Change'] = 0
-            datos['Gold_Returns'] = 0
-            datos['Oil_Returns'] = 0
-            datos['Nikkei_Return'] = 0
-            datos['DAX_Return'] = 0
-            datos['Futures_Return'] = 0
-            datos['DXY_Return'] = 0
-            datos['NYA_Return'] = 0
-
-        datos['Target'] = (datos['Close'].shift(-1) > datos['Close']).astype(int)
-
-        if datos.index.tz is not None:
-            datos.index = datos.index.tz_convert('America/New_York')
-
-        # Limpiar valores infinitos y nulos
-        datos = datos.replace([np.inf, -np.inf], np.nan)
-        datos_final = datos.dropna().copy()
-        
-        print(f"DEBUG: Datos procesados correctamente. Filas final: {len(datos_final)}")
-        return datos_final
-
-    except Exception as e:
-        st.error(f"Error procesando indicadores técnicos: {str(e)}")
-        return None
-
-
-        
-    except Exception as e:
-        print(f"DEBUG: Error generando gráfica: {e}")
-        return None
+# --- FUNCIONES DE ANÁLISIS TÉCNICO COMPLEMENTARIAS ---
+# (ADX, ATR, RSI ya están integradas en los módulos de análisis profundo)
 
 
 # Función principal de la app Streamlit
 def main():
-    # --- FIX: Event Loop is closed (Streamlit + yfinance) ---
+    # --- FIX: Event Loop handling for Streamlit ---
     try:
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
         if loop.is_closed():
-            raise RuntimeError("loop is closed")
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except:
+        pass
 
     st.set_page_config(
         page_title="StratEdge Portfolio | Multi-Horizon Strategy Suite",
@@ -2706,28 +2459,10 @@ def main():
                 st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
-    # --- CARGA DE DATOS ---
-    data = load_data(ticker, start_date, end_date)
-
-    if data is None or data.empty:
-        st.error("❌ No se pudieron cargar los datos.")
-        st.warning("💡 **Sugerencias:**")
-        st.write("1. Intenta con otra acción del menú (por ejemplo: **Apple (AAPL)** o **Microsoft (MSFT)**)")
-        st.write("2. Verifica tu conexión a internet")
-
-
-        # Mostrar acciones alternativas recomendadas
-        st.info("🔄 **Acciones recomendadas para probar:**")
-        recommended = ['Apple (AAPL)', 'Microsoft (MSFT)', 'SPY ETF', 'QQQ ETF']
-        for rec in recommended:
-            st.write(f"   • {rec}")
-        return
-
-    last_trading_day = data.index[-1]
-    last_close = data['Close'].iloc[-1]
-    last_open = data['Open'].iloc[-1]
-    previous_close = data['Close'].iloc[-2]
-
+    # --- CONFIGURACIÓN ESTRUCTURAL ---
+    # Nota: Ya no cargamos datos globales aquí para evitar lentitud y logs innecesarios.
+    # Cada módulo ahora gestiona sus propios datos bajo demanda.
+    
     # --- ESTRUCTURA DE PANTALLA PERSISTENTE: STRATEDGE HUB ---
     tab_list = ["🔬 Asset Scanner", "🎡 The Wheel", "🔍 Strategic Analysis", "📅 Economic Outlook", "📜 History"]
     
@@ -2825,6 +2560,17 @@ def main():
 
         
         
+        # --- CARGAR CACHÉ AL ABRIR (si no hay resultados en session_state) ---
+        if 'scan_results' not in st.session_state or st.session_state['scan_results'].empty:
+            cached_scanner = market_db.get_scanner_cache()
+            if not cached_scanner.empty:
+                st.session_state['scan_results'] = cached_scanner
+
+        # Mostrar info del último escaneo
+        last_scan_date = market_db.get_scanner_last_updated()
+        if last_scan_date:
+            st.caption(f"📅 Último escaneo guardado: **{last_scan_date}** (NY)")
+
         if st.button("🚀 Iniciar Escaneo de Mercado", type="primary"):
             scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol, smooth_check)
 
@@ -2844,6 +2590,10 @@ def main():
                 
                 scan_df = scan_df[scan_df['Score'] >= min_score].reset_index(drop=True)
                 st.session_state['scan_results'] = scan_df
+                
+                # Guardar en base de datos para persistencia
+                market_db.save_scanner_results(scan_df)
+                st.success("✅ Resultados guardados en base de datos. Se cargarán automáticamente la próxima vez.")
             else:
                 st.session_state['scan_results'] = pd.DataFrame()
                 st.warning("No se encontraron acciones. Intenta ampliar los filtros.")
@@ -3415,14 +3165,14 @@ def main():
             # --- HEADER: PERFIL DE LA EMPRESA ---
             w_stage = dd_tech.get('weinstein', 'N/D') if dd_tech else 'N/D'
             w_color = "#28a745" if "2" in str(w_stage) else "#dc3545" if "4" in str(w_stage) else "#ffc107"
-            w_badge = f'<span style="background:{w_color}; color:white; padding: 4px 10px; border-radius: 20px; font-size: 0.6em; margin-left: 10px; vertical-align: middle;">Etapa Weinstein: {w_stage}</span>' if w_stage != 'N/D' else ''
+            w_badge = f'<span style="background:{w_color}; color:white; padding: 4px 12px; border-radius: 20px; font-size: 0.55em; margin-left: 10px; vertical-align: middle; display: inline-block; white-space: nowrap;">Etapa Weinstein: {w_stage}</span>' if w_stage != 'N/D' else ''
 
             st.markdown(f"""
-            <div style="padding:20px; border-radius:12px; background: rgba(0,0,0,0.3); margin-bottom:15px;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-                    <div>
-                        <h2 style="margin:0; color:white;">{g['shortName']} ({dd_ticker}) {w_badge}</h2>
-                        <p style="margin:3px 0; color:#aaa;">{g['sector']} | {g['industry']} | {g['country']}</p>
+            <div style="padding:20px; border-radius:12px; background: rgba(0,0,0,0.3); margin-bottom:15px; border: 1px solid rgba(255,255,255,0.05);">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap: 15px;">
+                    <div style="flex: 1; min-width: 300px;">
+                        <h2 style="margin:0; color:white; line-height: 1.2;">{g['shortName']} ({dd_ticker}) {w_badge}</h2>
+                        <p style="margin:8px 0 0 0; color:#aaa; font-size:0.9em;">{g['sector']} | {g['industry']} | {g['country']}</p>
                     </div>
                     <div style="text-align:right;">
                         <h2 style="margin:0; color:white;">{g['price']:.2f} USD</h2>
@@ -3529,21 +3279,43 @@ def main():
                 if abs(val) >= 1e6: return f"{val/1e6:.0f}M"
                 return f"{val:,.0f}"
             
-            pe_val = dd_fin['valuation']['forwardPE'] or dd_fin['valuation']['trailingPE']
-            mk_col1.metric("P/E Ratio", fmt_v(pe_val, suffix='x'))
-            mk_col2.metric("PEG Ratio", fmt_v(dd_fin['valuation']['pegRatio']))
-            mk_col3.metric("Market Cap", fmt_b(g['marketCap']))
-            mk_col4.metric("ROE", fmt_v(dd_fin['profitability']['returnOnEquity'], pct=True))
-            mk_col5.metric("Margen Neto", fmt_v(dd_fin['profitability']['profitMargin'], pct=True))
-            mk_col6.metric("Crec. Ingresos", fmt_v(dd_fin['growth']['revenueGrowth'], pct=True))
+            # FILA 1: VALORACIÓN ESTRUCTURADA
+            v_data = dd_fin['valuation']
+            mk_col1, mk_col2, mk_col3, mk_col4, mk_col5, mk_col6 = st.columns(6)
             
+            # P/E con lógica inteligente (priorizando Trailing positivo)
+            trailing_pe = v_data.get('trailingPE')
+            has_trailing = trailing_pe is not None and trailing_pe > 0
+            
+            pe_val = trailing_pe if has_trailing else v_data.get('forwardPE')
+            pe_label = "P/E (Trailing)" if has_trailing else "P/E (Forward)"
+            if pe_val is None: pe_label = "P/E Ratio"
+
+            mk_col1.metric(pe_label, fmt_v(pe_val, suffix='x'))
+            mk_col2.metric("PEG Ratio", fmt_v(v_data['pegRatio']))
+            mk_col3.metric("P/Sales", fmt_v(v_data['priceToSales'], suffix='x'))
+            mk_col4.metric("P/Book", fmt_v(v_data['priceToBook'], suffix='x'))
+            mk_col5.metric("Market Cap", fmt_b(g['marketCap']))
+            mk_col6.metric("Enterprise Val.", fmt_b(g['enterpriseValue']))
+            
+            # FILA 2: RENDIMIENTO Y SOLVENCIA
             mk2_col1, mk2_col2, mk2_col3, mk2_col4, mk2_col5, mk2_col6 = st.columns(6)
-            mk2_col1.metric("Deuda/Equity", fmt_v(dd_fin['solvency']['debtToEquity']))
-            mk2_col2.metric("Current Ratio", fmt_v(dd_fin['solvency']['currentRatio']))
-            mk2_col3.metric("Free Cash Flow", fmt_b(dd_fin['solvency']['freeCashflow']))
-            mk2_col4.metric("Beta", fmt_v(dd_fin['risk']['beta']))
-            mk2_col5.metric("Div. Yield", fmt_v(dd_fin['dividends']['dividendYield'], pct=True))
-            mk2_col6.metric("EPS Forward", fmt_v(dd_fin['analyst']['forwardEps']))
+            mk2_col1.metric("ROE", fmt_v(dd_fin['profitability']['returnOnEquity'], pct=True))
+            mk2_col2.metric("Margen Neto", fmt_v(dd_fin['profitability']['profitMargin'], pct=True))
+            mk2_col3.metric("Crec. Ingresos", fmt_v(dd_fin['growth']['revenueGrowth'], pct=True))
+            mk2_col4.metric("Deuda/Equity", fmt_v(dd_fin['solvency']['debtToEquity']))
+            mk2_col5.metric("Current Ratio", fmt_v(dd_fin['solvency']['currentRatio']))
+            mk2_col6.metric("Free Cash Flow", fmt_b(dd_fin['solvency']['freeCashflow']))
+            
+            # FILA 3: RIESGO Y ANALISTAS
+            st.markdown("<br>", unsafe_allow_html=True)
+            mk3_col1, mk3_col2, mk3_col3, mk3_col4, mk3_col5, mk3_col6 = st.columns(6)
+            mk3_col1.metric("Beta (5Y)", fmt_v(dd_fin['risk']['beta']))
+            mk3_col2.metric("Short Ratio", fmt_v(dd_fin['risk']['shortRatio']))
+            mk3_col3.metric("Div. Yield", fmt_v(dd_fin['dividends']['dividendYield'], pct=True))
+            mk3_col4.metric("EPS Forward", fmt_v(dd_fin['analyst']['forwardEps']))
+            mk3_col5.metric("Opiniones", dd_fin['analyst']['numberOfAnalystOpinions'])
+            mk3_col6.metric("EV/EBITDA", fmt_v(v_data['evToEbitda'], suffix='x'))
             
             st.markdown("---")
             
