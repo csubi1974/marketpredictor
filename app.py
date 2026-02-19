@@ -1675,13 +1675,13 @@ def analyze_single_ticker_momentum(ticker, hist, price_min, price_max, min_volum
         if price > ema_20: score += 20
         # EMA 20 > EMA 50 (+20)
         if ema_20 > ema_50: score += 20
-        # RSI entre 50-70 (+20) o >70 (+10)
+        # RSI entre 50-70 (+20) o >70 (+10) - Score Momentum puro
         if 50 <= rsi <= 70: score += 20
         elif rsi > 70: score += 10
         # Cambio 5d positivo (+20)
         if chg_5d > 0: score += 20
         # Volumen superior al promedio (+20)
-        if vol_ratio > 1.1: score += 20 # Un poco más estricto con el volumen en bulk
+        if vol_ratio > 1.1: score += 20
         
         # --- FILTRO DE MOMENTUM SUAVE ---
         if smooth_momentum:
@@ -1692,15 +1692,21 @@ def analyze_single_ticker_momentum(ticker, hist, price_min, price_max, min_volum
             elif daily_vol > 0.04:
                 score -= 20
         
+        # Calcular Distancia a SMA 200 (Tendencia largo plazo)
+        sma_200 = hist['Close'].rolling(window=200).mean().iloc[-1] if len(hist) >= 200 else ema_50 # Fallback
+        dist_sma200 = ((price / sma_200) - 1) * 100
+
         return {
             'Ticker': ticker,
             'Precio': round(price, 2),
             'Score': score,
+            'RSI': round(rsi, 2),
             'Etapa W': w_stage,
             '1D%': round(chg_1d, 2),
             '5D%': round(chg_5d, 2),
             '20D%': round(chg_20d, 2),
-            'Vol_Ratio': round(vol_ratio, 2)
+            'Vol_Ratio': round(vol_ratio, 2),
+            'Dist_SMA200': round(dist_sma200, 2)
         }
     except:
         return None
@@ -1975,18 +1981,27 @@ class MarketDB:
                     ticker TEXT PRIMARY KEY,
                     price REAL,
                     score INTEGER,
+                    rsi REAL,
                     etapa_w TEXT,
                     chg_1d REAL,
                     chg_5d REAL,
                     chg_20d REAL,
                     vol_ratio REAL,
+                    dist_sma200 REAL,
                     sector TEXT,
                     last_updated TEXT
                 )
             ''')
+            # Migración: Añadir columnas nuevas si no existen
+            try:
+                cursor.execute("ALTER TABLE scanner_cache ADD COLUMN rsi REAL")
+                cursor.execute("ALTER TABLE scanner_cache ADD COLUMN dist_sma200 REAL")
+            except:
+                pass
+            
             conn.commit()
             conn.close()
-        except Error as e:
+        except Exception as e:
             print(f"DB Error: {e}")
 
     def save_wheel_results(self, df):
@@ -2044,12 +2059,12 @@ class MarketDB:
             for _, row in df.iterrows():
                 conn.execute('''
                     INSERT OR REPLACE INTO scanner_cache 
-                    (ticker, price, score, etapa_w, chg_1d, chg_5d, chg_20d, vol_ratio, sector, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (ticker, price, score, rsi, etapa_w, chg_1d, chg_5d, chg_20d, vol_ratio, dist_sma200, sector, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    row['Ticker'], row['Precio'], row['Score'], row.get('Etapa W', 'N/D'),
+                    row['Ticker'], row['Precio'], row['Score'], row.get('RSI', 50), row.get('Etapa W', 'N/D'),
                     row.get('1D%', 0), row.get('5D%', 0), row.get('20D%', 0),
-                    row.get('Vol_Ratio', 0), row.get('Sector', 'N/D'), now
+                    row.get('Vol_Ratio', 0), row.get('Dist_SMA200', 0), row.get('Sector', 'N/D'), now
                 ))
             conn.commit()
             conn.close()
@@ -2215,9 +2230,74 @@ market_db = MarketDB()
 # (Removidas para optimizar el rendimiento y eliminar logs DEBUG)
         
 
-# --- FUNCIONES DE ANÁLISIS TÉCNICO COMPLEMENTARIAS ---
-# (ADX, ATR, RSI ya están integradas en los módulos de análisis profundo)
 
+# --- UTILIDADES DE MERCADO Y CONTEXTO ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_market_context():
+    """Analiza la tendencia general del mercado (SPY) y sectorial."""
+    try:
+        # Tickers: SPY + 11 Sectores
+        tickers = ['SPY', 'XLK', 'XLF', 'XLE', 'XLV', 'XLY', 'XLP', 'XLU', 'XLI', 'XLB', 'XLRE', 'XLC']
+        # Descarga optimizada
+        data = yf.download(tickers, period='1y', interval='1d', group_by='ticker', progress=False, auto_adjust=True)
+        
+        context = {}
+        
+        # 1. Analizar Tendencia SPY (Mercado General)
+        # Manejo robusto de MultiIndex de yfinance
+        try:
+            spy_hist = data['SPY'].dropna()
+        except KeyError:
+             return None
+             
+        if not spy_hist.empty:
+            price = spy_hist['Close'].iloc[-1]
+            sma_200 = spy_hist['Close'].rolling(window=200).mean().iloc[-1]
+            
+            trend = "ALCISTA" if price > sma_200 else "BAJISTA"
+            
+            context['SPY'] = {
+                'Price': price,
+                'SMA200': sma_200,
+                'Trend': trend,
+                'Dist_SMA200': ((price/sma_200)-1)*100
+            }
+        
+        # 2. Ranking de Sectores
+        sector_perf = []
+        sector_names = {
+            'XLK': 'Tecnología', 'XLF': 'Financiero', 'XLE': 'Energía', 'XLV': 'Salud',
+            'XLY': 'Consumo Disc.', 'XLP': 'Consumo Básico', 'XLU': 'Utilities', 
+            'XLI': 'Industrial', 'XLB': 'Materiales', 'XLRE': 'Real Estate', 'XLC': 'Comunicaciones'
+        }
+        
+        for t in tickers:
+            if t == 'SPY': continue
+            try:
+                hist = data[t].dropna()
+                if not hist.empty:
+                    # Performance relativo a 20 días y distancia a SMA50
+                    p = hist['Close'].iloc[-1]
+                    sma_50 = hist['Close'].rolling(window=50).mean().iloc[-1]
+                    chg_20d = ((p / hist['Close'].iloc[-21]) - 1) * 100 if len(hist) > 20 else 0
+                    dist_sma50 = ((p / sma_50) - 1) * 100
+                    
+                    # Score simple de fuerza relativa
+                    score = chg_20d + dist_sma50
+                    sector_perf.append({
+                        'Ticker': t, 
+                        'Name': sector_names.get(t, t),
+                        'Score': score, 
+                        'Chg_20d': chg_20d
+                    })
+            except:
+                continue
+        
+        context['Sectors'] = pd.DataFrame(sector_perf).sort_values('Score', ascending=False)
+        return context
+    except Exception as e:
+        print(f"Market Context Error: {e}")
+        return None
 
 # Función principal de la app Streamlit
 def main():
@@ -2540,11 +2620,42 @@ def main():
 
     # --- MOMENTUM SCANNER TAB ---
     if active_tab == "🔬 Asset Scanner":
-        st.subheader("🔬 Momentum Scanner & Rotación de Sectores")
-        st.info("💡 Análisis de flujo de capital. Identifica qué sectores lideran el mercado antes de elegir una acción.")
+        st.subheader("🔬 Buscador de Oportunidades: Momentum & Reversión")
+        
+        # --- SEMÁFORO DE MERCADO ---
+        mkt_context = get_market_context()
+        if mkt_context and 'SPY' in mkt_context:
+            spy_data = mkt_context['SPY']
+            trend_color = "#28a745" if spy_data['Trend'] == 'ALCISTA' else "#dc3545"
+            trend_icon = "📈" if spy_data['Trend'] == 'ALCISTA' else "📉"
+            
+            # Obtener top sectores
+            top_sectors = ""
+            if not mkt_context['Sectors'].empty:
+                top_3 = mkt_context['Sectors'].head(3)
+                top_sectors = " | ".join([f"**{r['Name']}**" for _, r in top_3.iterrows()])
+            
+            st.markdown(f"""
+                <div style='padding: 15px; border-radius: 10px; background: rgba(0,0,0,0.2); border: 1px solid {trend_color}; margin-bottom: 20px;'>
+                    <div style='display: flex; justify-content: space-between; align-items: center;'>
+                        <div>
+                            <span style='color: #bbb; font-size: 0.9em;'>TENDENCIA DE MERCADO (SPY)</span><br>
+                            <strong style='color: {trend_color}; font-size: 1.2em;'>{trend_icon} {spy_data['Trend']}</strong>
+                            <span style='color: #888; font-size: 0.8em; margin-left: 10px;'>(SMA 200 Dist: {spy_data['Dist_SMA200']:.1f}%)</span>
+                        </div>
+                        <div style='text-align: right;'>
+                            <span style='color: #bbb; font-size: 0.9em;'>SECTORES FUERTES</span><br>
+                            <span style='color: #eee;'>{top_sectors}</span>
+                        </div>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
+        st.info("💡 **Momentum:** Sigue la fuerza (comprar alto para vender más alto). **Reversión:** Busca rebotes en caídas (comprar barato en soporte).")
         
         # Filtros en columnas
         filt_col1, filt_col2, filt_col3 = st.columns(3)
+
         with filt_col1:
             price_range = st.slider("💲 Rango de Precio ($)", min_value=5, max_value=2000, value=(10, 800), step=5)
         with filt_col2:
@@ -2555,8 +2666,15 @@ def main():
             force_filter = st.selectbox("⚡ Fuerza Mínima", ['Moderado (40+)', 'Fuerte (60+)', 'Explosivo (80+)'], index=0)
             min_score = int(force_filter.split('(')[1].replace('+)', ''))
         
-        # Filtro de Volatilidad (Smooth Momentum)
-        smooth_check = st.checkbox("🧘 Filtrar por 'Momentum Suave' (Busca subidas constantes, evita saltos violentos)", value=False)
+        
+        # Filtros Avanzados
+        fc_1, fc_2 = st.columns(2)
+        with fc_1:
+             # Filtro de Volatilidad (Smooth Momentum)
+            smooth_check = st.checkbox("🧘 Filtrar por 'Momentum Suave' (Evita saltos violentos)", value=False)
+        with fc_2:
+            # Filtro de Sobreventa
+            oversold_mode = st.checkbox("📉 Buscar 'Reversión / Sobreventa' (RSI < 35)", value=False)
 
         
         
@@ -2589,7 +2707,25 @@ def main():
                     scan_df['Sector'] = sectors
                 
                 scan_df = scan_df[scan_df['Score'] >= min_score].reset_index(drop=True)
+                
+                # --- LOGICA DE FILTRADO PARA SOBREVENTA ---
+                if oversold_mode:
+                    if 'RSI' in scan_df.columns:
+                        # Filtrar RSI bajo (sobreventa)
+                        # También verificamos que no sea una "caída libre" total (ej. precio > SMA200 preferiblemente, o RSI extremo < 25)
+                        # Aquí somos permisivos con el filtro: RSI < 35
+                        scan_df = scan_df[scan_df['RSI'] < 35].copy()
+                        
+                        # Ordenar por RSI ascendente (los más sobrevendidos primero) -> O tal vez por Score de "calidad"
+                        # Vamos a ordenar por RSI ascendente para ver los más extremos
+                        scan_df = scan_df.sort_values('RSI', ascending=True)
+                        
+                        st.success(f"🔍 Modo Reversión: {len(scan_df)} activos sobrevendidos encontrados.")
+                    else:
+                        st.warning("Datos de RSI no disponibles en el escaneo actual.")
+                
                 st.session_state['scan_results'] = scan_df
+
                 
                 # Guardar en base de datos para persistencia
                 market_db.save_scanner_results(scan_df)
@@ -2699,10 +2835,30 @@ def main():
                 elif "4" in str(val): return 'color: #dc3545; font-weight: bold'
                 elif "1" in str(val) or "3" in str(val): return 'color: #ffc107'
                 return ''
+
+            def color_rsi(val):
+                try:
+                    v = float(val)
+                    if v < 30: return 'color: #ffc107; font-weight: bold; background-color: rgba(255, 0, 0, 0.2)' # Sobrevendido crítico
+                    elif v > 70: return 'color: #28a745; font-weight: bold' # Sobrecompra (Fuerza en momentum)
+                except: pass
+                return ''
             
-            styled = scan_df.style.map(color_score, subset=['Score'])
-            styled = styled.map(color_change, subset=['1D%', '5D%', '20D%'])
+            # Columnas a mostrar dinámicamente
+            cols_to_show = ['Ticker', 'Precio', 'Score', 'RSI', 'Etapa W', '1D%', '5D%', 'Vol_Ratio', 'Sector']
+            if not oversold_mode:
+                # En modo normal, ocultamos RSI si se quiere simplificar, pero mejor mostrarlo siempre
+                pass
+            
+            # Asegurar que existan las columnas
+            available_cols = [c for c in cols_to_show if c in scan_df.columns]
+            
+            styled = scan_df[available_cols].style.map(color_score, subset=['Score'])
+            styled = styled.map(color_change, subset=['1D%', '5D%'])
             styled = styled.map(color_weinstein, subset=['Etapa W'])
+            if 'RSI' in available_cols:
+                styled = styled.map(color_rsi, subset=['RSI'])
+                
             st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
             
             # Selección de acción para análisis profundo
