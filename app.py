@@ -2,16 +2,11 @@ import pandas as pd
 import numpy as np
 import re
 import io
-from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier, GradientBoostingClassifier
-from xgboost import XGBClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from dotenv import load_dotenv
 import yfinance as yf
 import datetime
 from datetime import datetime as dt, date as d_type, timedelta
 import streamlit as st
-import joblib
 import os
 import plotly.graph_objects as go
 import time
@@ -19,8 +14,12 @@ import requests
 import json
 import sqlite3
 from sqlite3 import Error
+from scipy.stats import norm
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone as tz, timedelta as td, time as t_time
-from datetime import timezone as tz, timedelta as td, time as t_time
+import asyncio
+
+
 try:
     from dotenv import load_dotenv
     load_dotenv() # Carga variables del archivo .env
@@ -29,7 +28,6 @@ except ImportError:
 
 # Lista de las 20 acciones más importantes (puedes modificar esta lista según tus preferencias)
 TOP_20_STOCKS = {
-    'S&P 500 (SPX)': '^GSPC',
     'SPY ETF': 'SPY',
     'QQQ ETF': 'QQQ',
     'Apple (AAPL)': 'AAPL',
@@ -50,15 +48,6 @@ TOP_20_STOCKS = {
     'Mastercard (MA)': 'MA',
     'Chevron (CVX)': 'CVX'
 }
-
-# Definición global de variables del modelo (Fuente única de verdad)
-# Usamos solo variables estacionarias (porcentajes/ratios) para evitar el drift del precio
-GLOBAL_FEATURES = [
-    'Returns', 'Dist_MA20', 'Dist_MA50', 'Dist_MA200', 
-    'RSI', 'Volatility', 'VIX_Change', 'Yield_Change', 
-    'MACD_Rel', 'BB_Pos', 'Return_Lag1', 'Nikkei_Return', 'DAX_Return', 
-    'Futures_Return', 'Volume_Ratio', 'Momentum_5d', 'DXY_Return', 'NYA_Return'
-]
 
 def get_ny_time():
     """Obtiene la hora oficial de Nueva York (EST/EDT)."""
@@ -132,130 +121,41 @@ def calculate_adx(df, window=14):
     adx = dx.rolling(window=window).mean()
     return adx.fillna(0)
 
-def calculate_crash_risk(df):
-    """Analiza múltiples factores para determinar el riesgo de una caída sistémica."""
-    try:
-        last = df.iloc[-1]
-        vix_chg = last.get('VIX_Change', 0)
-        dist_200 = last.get('Dist_MA200', 0)
-        vol = last.get('Volatility', 0)
-        rsi = last.get('RSI', 50)
+def get_weinstein_stage(df):
+    """Determina la etapa de Weinstein (1-4) basada en la SMA 150 y su pendiente."""
+    if len(df) < 150:
+        return "N/D"
+    
+    # Usamos 150 periodos como aproximación de 30 semanas (Weinstein estándar)
+    sma_150 = df['Close'].rolling(window=150).mean()
+    if sma_150.isna().all():
+        return "N/D"
         
-        risk_score = 0
-        reasons = []
+    curr_price = df['Close'].iloc[-1]
+    curr_sma = sma_150.iloc[-1]
+    
+    # Pendiente basada en los últimos 20 días (1 mes de trading)
+    prev_sma = sma_150.iloc[-21] if len(sma_150) > 21 else sma_150.iloc[0]
+    slope = (curr_sma - prev_sma) / prev_sma
+    dist = (curr_price - curr_sma) / curr_sma
+    
+    # Definición de etapas
+    # Etapa 2: Avanzando (Precio > SMA + SMA subiendo)
+    if dist > 0.02 and slope > 0.005:
+        return "2 (Alcista)"
+    # Etapa 4: Declive (Precio < SMA + SMA bajando)
+    elif dist < -0.02 and slope < -0.005:
+        return "4 (Bajista)"
+    # Etapa 1 o 3 (Consolidación / Techo)
+    else:
+        # Si viene de abajo es Etapa 1 (Acumulación), si viene de arriba Etapa 3 (Distribución)
+        # Simplificamos como consolidación si el slope es plano
+        if abs(slope) < 0.005:
+            if curr_price > curr_sma: return "3 (Distribución)"
+            else: return "1 (Acumulación)"
+        return "Transición"
 
-        # 1. Pánico en el VIX
-        if vix_chg > 0.10: 
-            risk_score += 2
-            reasons.append("Pico de volatilidad en el VIX (>10%)")
-        
-        # 2. Debilidad de Tendencia (Precio bajo MA200)
-        if dist_200 < -0.05:
-            risk_score += 2
-            reasons.append("Debilidad estructural (Bajo MA200)")
-        
-        # 3. Sobre-extensión Bullish (Burbuja inmediata)
-        if dist_200 > 0.15:
-            risk_score += 1
-            reasons.append("Sobre-extensión alcista (Riesgo de reversión)")
 
-        # 4. Volatilidad del Activo
-        if vol > df['Volatility'].mean() * 1.5:
-            risk_score += 1
-            reasons.append("Volatilidad atípica detectada")
-
-        # Determinar Nivel
-        if risk_score >= 4:
-            return "EXTREMO (Black Swan Alert)", "#dc3545", "🆘", reasons
-        elif risk_score >= 2:
-            return "ALTO (Protección de Capital)", "#fd7e14", "⚠️", reasons
-        elif risk_score >= 1:
-            return "MODERADO (Precaución)", "#ffc107", "🧐", reasons
-        else:
-            return "BAJO (Entorno Protegido)", "#28a745", "🛡️", ["Condiciones de mercado estables"]
-    except:
-        return "DESCONOCIDO", "#6c757d", "❓", ["Faltan datos de riesgo"]
-
-# Función para calcular Momentum Intradía (Sniper Entry)
-def get_intraday_momentum(ticker):
-    """Descarga datos de 5m y calcula el momentum actual incluyendo Pre-market."""
-    try:
-        t_obj = yf.Ticker(ticker)
-        # Pedimos 5 días para asegurar que saltamos el feriado de ayer (Presidents' Day)
-        # include_prepost es crucial para ver el pre-market de hoy martes
-        # auto_adjust=False para que el precio coincida con el nominal de la web (sin descontar dividendos)
-        data_5m = t_obj.history(period="5d", interval="5m", prepost=True, auto_adjust=False)
-        
-        if data_5m.empty:
-            return None
-        
-        # Aplanar columnas
-        if isinstance(data_5m.columns, pd.MultiIndex):
-            data_5m.columns = data_5m.columns.get_level_values(0)
-
-        # 0. Descargar VIX Intradía (Latido del Miedo)
-        try:
-            v_obj = yf.Ticker("^VIX")
-            vix_5m = v_obj.history(period="2d", interval="5m", prepost=True)
-            if isinstance(vix_5m.columns, pd.MultiIndex): vix_5m.columns = vix_5m.columns.get_level_values(0)
-        except:
-            vix_5m = pd.DataFrame()
-
-        # 1. Identificar la sesión más reciente disponible (Hoy martes o el último pre-market activo)
-        latest_date = data_5m.index[-1].date()
-        today_data = data_5m[data_5m.index.date == latest_date].copy()
-        
-        if today_data.empty: 
-            return None
-
-        # 1.5 Obtener Cierre Anterior para referencia (Gap analysis)
-        try:
-            prev_sessions = data_5m[data_5m.index.date < latest_date]
-            prev_close = prev_sessions['Close'].iloc[-1] if not prev_sessions.empty else today_open
-        except:
-            prev_close = today_open
-
-        # 2. Calcular VWAP (Manejar volumen cero del pre-market)
-        v_p = today_data['Close'] * today_data['Volume']
-        cum_vol = today_data['Volume'].cumsum()
-        # Si no hay volumen (pre-market inicial), el VWAP es igual al Precio
-        today_data['VWAP'] = (v_p.cumsum() / cum_vol).fillna(today_data['Close'])
-
-        # 3. EMA 20
-        today_data['EMA20'] = today_data['Close'].ewm(span=20, adjust=False).mean()
-        
-        last_price = today_data['Close'].iloc[-1]
-        last_vwap = today_data['VWAP'].iloc[-1]
-        last_ema = today_data['EMA20'].iloc[-1]
-        today_open = today_data['Open'].iloc[0]
-        
-        # --- VALIDADOR DE TENDENCIA ---
-        score = 0
-        if last_price > today_open: score += 1
-        if last_price > last_vwap: score += 1
-        if last_price > last_ema: score += 1
-        
-        bear_score = 0
-        if last_price < today_open: bear_score += 1
-        if last_price < last_vwap: bear_score += 1
-        if last_price < last_ema: bear_score += 1
-
-        # Configuración visual
-        if score == 3: status, color, icon = ("CONFIRMED BULLISH", "#28a745", "🚀")
-        elif bear_score == 3: status, color, icon = ("CONFIRMED BEARISH", "#dc3545", "📉")
-        elif score >= 2: status, color, icon = ("MODERATE BULLISH", "#4ade80", "�")
-        elif bear_score >= 2: status, color, icon = ("MODERATE BEARISH", "#f87171", "📉")
-        else: status, color, icon = ("SIDEWAYS (Rango)", "#94a3b8", "⏳")
-            
-        return {
-            'price': last_price, 'vwap': last_vwap, 'ema': last_ema, 'open': today_open, 'prev_close': prev_close,
-            'status': status, 'color': color, 'icon': icon, 'score': score, 'bear_score': bear_score,
-            'force': (max(score, bear_score) / 3) * 100,
-            'data': today_data, 'vix_data': vix_5m if not vix_5m.empty else None
-        }
-    except Exception as e:
-        print(f"DEBUG Error Sniper: {e}")
-        return None
 
 def get_options_sentiment(ticker):
     """Descarga opciones, calcula P/C Ratio y detecta Muros de Gamma (GEX)."""
@@ -310,10 +210,7 @@ def get_options_sentiment(ticker):
             'put_wall': put_wall
         }
     except Exception as e:
-        print(f"Error Opciones: {e}")
-        return None
-    except Exception as e:
-        print(f"Error en Intraday Monitor: {e}")
+        print(f"Error Opciones o Intraday: {e}")
         return None
 
 def get_llm_analysis(api_key, context_data):
@@ -326,22 +223,19 @@ def get_llm_analysis(api_key, context_data):
     }
     
     prompt = f"""
-    Actúa como un Trader Institucional de Elite. Analiza estos datos del S&P 500 y dame una ESTRATEGIA EJECUTABLE (Breve y Directa).
+    Actúa como un Estratega Jefe de Inversiones de StratEdge Portfolio. Tu objetivo es analizar datos para horizontes de Corto, Mediano y Largo Plazo.
     
     DATOS DEL MERCADO:
-    - Predicción IA: {context_data.get('prediction', 'N/A')} (Confianza: {context_data.get('confidence', '0%')})
-    - Riesgo Sistémico (Crash): {context_data.get('risk', 'N/A')}
-    - Tendencia Intradía (Sniper): {context_data.get('sniper_status', 'N/A')} (Fuerza: {context_data.get('sniper_force', '0')}%)
-    - Sentimiento Opciones: {context_data.get('options_sent', 'N/A')} (P/C Ratio: {context_data.get('pc_ratio', 'N/A')})
-    - Call Wall: {context_data.get('call_wall', 'N/A')} | Put Wall: {context_data.get('put_wall', 'N/A')}
-    - Contexto: {context_data.get('context_note', '')}
+    - Tendencia de Activo: {context_data.get('sniper_status', 'N/A')}
+    - Sentimiento Opciones: {context_data.get('options_sent', 'N/A')}
+    - Niveles Clave (Call/Put Wall): {context_data.get('call_wall', 'N/A')} / {context_data.get('put_wall', 'N/A')}
     
     TU MISIÓN:
-    1. SINTETIZA: ¿Cuál es la "narrativa" real del mercado hoy? (Bull Trap, Subida Sana, Pánico, etc.)
-    2. PLAN DE ATAQUE: ¿Qué debo hacer? (Long, Short, Esperar). Define zonas de entrada/salida si puedes inferirlas.
-    3. ADVERTENCIA: ¿Cuál es el mayor peligro ahora mismo?
+    1. PANORAMA MULTI-HORIZONTE: Define la situación técnica en el Corto (días), Mediano (semanas) y Largo Plazo (meses).
+    2. ESTRATEGIA RECOMENDADA: ¿Es momento de Acumular, Mantener, Proteger o Liquidar?
+    3. FACTOR DE RIESGO: ¿Cuál es el principal obstáculo para esta tesis de inversión?
     
-    Responde en formato Markdown, con estilo militar/profesional. Máximo 150 palabras.
+    Responde en formato Markdown, con estilo profesional y estratégico. Sé directo.
     """
     
     payload = {
@@ -381,64 +275,181 @@ def get_market_news(ticker):
                     for n in news:
                         title = n.get('title', '')
                         if title and title not in seen_titles:
-                            headlines.append(f"- {title} ({n.get('publisher', 'Yahoo Finance')})")
+                            headlines.append(f"- {title} ({n.get('publisher', 'Intelligence Hub')})")
                             seen_titles.add(title)
                         if len(headlines) >= 8: break
             except:
                 continue
                 
-        return "\n".join(headlines) if headlines else "No se detectaron noticias urgentes en los canales de Yahoo Finance ahora mismo."
+        return "\n".join(headlines) if headlines else "No se detectaron noticias urgentes en los canales de StratEdge Intelligence ahora mismo."
     except Exception as e:
         return f"Nota: Servicio de noticias temporalmente limitado. Enfoque en análisis técnico. ({str(e)})"
 
-@st.cache_data(ttl=1800)
-def get_economic_calendar():
-    """Obtiene el calendario híbrido: Blueprint para la semana + Scraper para datos reales."""
+@st.cache_data(ttl=60)
+def get_ticker_snapshot(ticker):
+    """Obtiene un resumen rápido del precio actual y cambio del día."""
     try:
-        # 1. Cargar Blueprint (Estructura de la semana)
+        tk = yf.Ticker(ticker)
+        data = tk.history(period='2d')
+        if len(data) < 1: return f"No se hallaron datos para {ticker}."
+        
+        last_close = data['Close'].iloc[-1]
+        prev_close = data['Close'].iloc[-2] if len(data) > 1 else data['Open'].iloc[-1]
+        change = last_close - prev_close
+        pct = (change / prev_close) * 100
+        
+        info = tk.info
+        name = info.get('shortName', ticker)
+        
+        return {
+            "Ticker": ticker,
+            "Nombre": name,
+            "Precio": f"${last_close:.2f}",
+            "Cambio": f"{change:+.2f} ({pct:+.2f}%)",
+            "Rango Hoy": f"${data['Low'].iloc[-1]:.2f} - ${data['High'].iloc[-1]:.2f}",
+            "Volumen": f"{data['Volume'].iloc[-1]:,}"
+        }
+    except Exception as e:
+        return f"Error obteniendo snapshot de {ticker}: {e}"
+
+@st.cache_data(ttl=3600)
+def get_platform_info():
+    """Lee el manual/README del proyecto para explicar funciones al usuario."""
+    try:
+        path = "README.md"
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        return "Manual no disponible. StratEdge Portfolio ofrece Strategy Hub, Asset Scanner, Wheel Strategy y Strategic Analysis."
+    except:
+        return "Error al leer el manual."
+
+@st.cache_data(ttl=1800)
+def get_economic_calendar(date_str=None, days=7):
+    """Obtiene el calendario para una fecha o un rango de días (semana completa por defecto)."""
+    try:
+        ny_now = get_ny_time()
+        # Eliminar info de zona horaria para cálculos de timedelta si date_str es None
+        if not date_str:
+            start_date = ny_now.replace(tzinfo=None)
+        else:
+            start_date = dt.strptime(date_str, "%Y-%m-%d")
+            
+        all_results = []
+        for i in range(days):
+            current_day = (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
+            try:
+                # Intentamos obtener datos de Yahoo Finance
+                url = f"https://finance.yahoo.com/calendar/economic?day={current_day}&region=US"
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                response = requests.get(url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    tables = pd.read_html(io.StringIO(response.text))
+                    if tables:
+                        scrape_df = tables[0]
+                        # Limpiar nombres de columnas (quitar espacios especiales)
+                        scrape_df.columns = [str(c).replace('\xa0', ' ').strip() for c in scrape_df.columns]
+                        
+                        # Mapeo flexible de columnas de Yahoo Finance
+                        col_map = {
+                            'Event Time': 'Hora',
+                            'Time (ET)': 'Hora',
+                            'Event': 'Evento',
+                            'Market Expectation': 'Previsto',
+                            'Briefing': 'Previsto',
+                            'Actual': 'Actual',
+                            'Prior to This': 'Anterior',
+                            'Prior': 'Anterior',
+                            'Country': 'Pais'
+                        }
+                        
+                        for _, row in scrape_df.iterrows():
+                            # Filtrar solo eventos de EE.UU. para evitar ruido
+                            pais = row.get('Country', row.get('Pais', ''))
+                            if str(pais).upper() != 'US':
+                                continue
+                                
+                            all_results.append({
+                                "Fecha": current_day,
+                                "Hora": row.get('Event Time', row.get('Time (ET)', '-')),
+                                "Evento": str(row.get('Event', '')).split('*')[0].strip(),
+                                "Actual": row.get('Actual', '-'),
+                                "Previsto": row.get('Market Expectation', row.get('Briefing', '-')),
+                                "Anterior": row.get('Prior to This', row.get('Prior', '-')),
+                                "Pais": 'US'
+                            })
+            except: continue
+        
+        df_scrape = pd.DataFrame(all_results)
+        
+        # Combinar con blueprint estático para mayor robustez
         blueprint_path = "macro_blueprint.json"
         if os.path.exists(blueprint_path):
             with open(blueprint_path, 'r') as f:
                 bp_data = json.load(f)
-            df = pd.DataFrame(bp_data['events'])
-        else:
-            # Fallback si no hay blueprint: usar scraper puro
-            df = pd.DataFrame(columns=['Fecha', 'Hora', 'Evento', 'Actual', 'Previsto', 'Anterior'])
-
-        # 2. Scrapear Yahoo para "Hoy" para rellenar los datos de "Actual"
-        try:
-            today_str = get_ny_time().strftime("%Y-%m-%d")
-            url = f"https://finance.yahoo.com/calendar/economic?day={today_str}&region=US"
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            df_bp = pd.DataFrame(bp_data['events'])
             
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                tables = pd.read_html(io.StringIO(response.text))
-                if tables:
-                    scrape_df = tables[0]
-                    scrape_df.columns = [str(c).replace('\xa0', ' ') for c in scrape_df.columns]
-                    
-                    # Actualizar valores en nuestro DF principal si coinciden los nombres de eventos
-                    for _, row in scrape_df.iterrows():
-                        event_name = str(row.get('Event', '')).split('*')[0].strip()
-                        actual_val = row.get('Actual', '-')
-                        # Buscar en nuestro DF (Búsqueda difusa o parcial)
-                        mask = df['Evento'].str.contains(event_name, case=False, na=False)
-                        if mask.any():
-                            df.loc[mask, 'Actual'] = str(actual_val)
-        except Exception as e:
-            print(f"Aviso Scraper: No se pudo actualizar datos reales ({e})")
+            # Normalizar fechas para comparación y deduplicación
+            # El blueprint usa "Feb 17, 2026", el scraper usa "2026-02-17"
+            def normalize_date(d):
+                try:
+                    if ',' in str(d): # Formato blueprint
+                        return dt.strptime(str(d), "%b %d, %Y").strftime("%Y-%m-%d")
+                    return str(d) # Formato scraper yf
+                except: return str(d)
+                
+            df_bp['Fecha_Sort'] = df_bp['Fecha'].apply(normalize_date)
+            if not df_scrape.empty:
+                df_scrape['Fecha_Sort'] = df_scrape['Fecha']
+                df_final = pd.concat([df_bp, df_scrape]).drop_duplicates(subset=['Fecha_Sort', 'Evento'], keep='last')
+            else:
+                df_final = df_bp
+            
+            # Restaurar formato visible de fecha
+            df_final['Fecha'] = df_final['Fecha_Sort'].apply(lambda x: dt.strptime(x, "%Y-%m-%d").strftime("%b %d, %Y"))
+        else:
+            df_final = df_scrape
+            if not df_final.empty:
+                df_final['Fecha_Sort'] = df_final['Fecha']
+                df_final['Fecha'] = df_final['Fecha'].apply(lambda x: dt.strptime(x, "%Y-%m-%d").strftime("%b %d, %Y"))
 
-        # Limpiar y ordenar
-        df = df.replace('nan', '-').fillna('-')
-        cols_to_show = ['Fecha', 'Hora', 'Evento', 'Actual', 'Previsto', 'Anterior']
-        existing_cols = [c for c in cols_to_show if c in df.columns]
-        return df[existing_cols]
+        if df_final.empty: 
+            return pd.DataFrame(columns=['Fecha', 'Hora', 'Evento', 'Actual', 'Previsto', 'Anterior'])
+        
+        df_final = df_final.replace('nan', '-').fillna('-')
+        # Asegurar orden cronológico
+        df_final = df_final.sort_values(['Fecha_Sort', 'Hora']).reset_index(drop=True)
+        return df_final[['Fecha', 'Hora', 'Evento', 'Actual', 'Previsto', 'Anterior']]
 
     except Exception as e:
-        return pd.DataFrame({"Error": [f"Error en calendario híbrido: {str(e)}"]})
+        return pd.DataFrame({"Error": [f"Error detectado: {str(e)}"]})
+
 
 # --- DEEP DIVE ANALYSIS MODULE ---
+
+def translate_text(api_key, text, target_lang="Spanish"):
+    """Traduce un texto usando la IA de Groq."""
+    if not api_key or not text or text == 'Sin descripción disponible.':
+        return text
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        prompt = f"Traduce el siguiente texto de descripción de empresa al {target_lang}. Mantén un tono profesional y técnico. No añadas comentarios extra, solo la traducción:\n\n{text}"
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 1000
+        }
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                           headers=headers, json=payload, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()['choices'][0]['message']['content']
+        return text
+    except:
+        return text
 
 def get_deep_financials(ticker):
     """Extrae datos financieros profundos: Balance, Income Statement, Cash Flow."""
@@ -453,6 +464,12 @@ def get_deep_financials(ticker):
         dist_52h = ((price / high_52) - 1) * 100 if high_52 > 0 else 0
         dist_52l = ((price / low_52) - 1) * 100 if low_52 > 0 else 0
         
+        # Obtener resumen y traducir si es posible
+        summary_en = info.get('longBusinessSummary', 'Sin descripción disponible.')
+        
+        # Intentar traducción si hay API Key (usamos la global o la de st.secrets si existiera)
+        # Para simplificar, lo dejamos para el retorno final
+        
         general = {
             'shortName': info.get('shortName', ticker),
             'sector': info.get('sector', 'N/D'),
@@ -460,7 +477,7 @@ def get_deep_financials(ticker):
             'country': info.get('country', 'N/D'),
             'employees': info.get('fullTimeEmployees', 0),
             'website': info.get('website', ''),
-            'summary': info.get('longBusinessSummary', 'Sin descripción disponible.'),
+            'summary': summary_en,
             'price': price,
             'high_52': high_52,
             'low_52': low_52,
@@ -556,7 +573,7 @@ def get_deep_financials(ticker):
                     income_history.append(year_data)
         except:
             pass
-
+ 
         # --- BALANCE (Balance Sheet) ---
         balance_data = {}
         try:
@@ -570,7 +587,7 @@ def get_deep_financials(ticker):
                 balance_data['totalDebt'] = float(latest.get('Total Debt', 0))
         except:
             pass
-
+ 
         # --- CASH FLOW ---
         cashflow_data = {}
         try:
@@ -771,8 +788,8 @@ def get_deep_technical_analysis(ticker):
     try:
         t = yf.Ticker(ticker)
         
-        # Datos diarios (6 meses)
-        daily = t.history(period='6mo', interval='1d', auto_adjust=True)
+        # Datos diarios (1 año para SMA 150/200 y Weinstein)
+        daily = t.history(period='1y', interval='1d', auto_adjust=True)
         if daily.empty:
             return None
         
@@ -781,6 +798,9 @@ def get_deep_technical_analysis(ticker):
         
         price = daily['Close'].iloc[-1]
         
+        # Weinstein Stage
+        w_stage = get_weinstein_stage(daily)
+
         # Medias Móviles
         ema_9 = daily['Close'].ewm(span=9).mean().iloc[-1]
         ema_20 = daily['Close'].ewm(span=20).mean().iloc[-1]
@@ -821,9 +841,10 @@ def get_deep_technical_analysis(ticker):
         chg_5d = ((price / daily['Close'].iloc[-6]) - 1) * 100 if len(daily) > 5 else 0
         chg_1m = ((price / daily['Close'].iloc[-22]) - 1) * 100 if len(daily) > 22 else 0
         chg_3m = ((price / daily['Close'].iloc[-66]) - 1) * 100 if len(daily) > 66 else 0
-        chg_6m = ((price / daily['Close'].iloc[0]) - 1) * 100
+        chg_6m = ((price / daily['Close'].iloc[-132]) - 1) * 100 if len(daily) > 132 else 0
+        chg_1y = ((price / daily['Close'].iloc[0]) - 1) * 100 if len(daily) > 250 else 0
         
-        # Fibonacci (6 meses)
+        # Fibonacci (1 año)
         fib_high = daily['High'].max()
         fib_low = daily['Low'].min()
         fib_diff = fib_high - fib_low
@@ -856,18 +877,24 @@ def get_deep_technical_analysis(ticker):
         
         return {
             'price': price,
+            'weinstein': w_stage,
             'ema_9': ema_9, 'ema_20': ema_20, 'ema_50': ema_50, 'sma_200': sma_200,
             'rsi': rsi,
             'macd': macd_val, 'signal': signal_val, 'macd_hist': macd_hist,
             'bb_upper': bb_upper, 'bb_lower': bb_lower, 'bb_position': bb_position,
             'atr': atr, 'adx': adx,
             'vol_ratio': vol_ratio, 'avg_vol_20': avg_vol_20,
-            'chg_1d': chg_1d, 'chg_5d': chg_5d, 'chg_1m': chg_1m, 'chg_3m': chg_3m, 'chg_6m': chg_6m,
+            'chg_1d': chg_1d, 'chg_5d': chg_5d, 'chg_1m': chg_1m, 'chg_3m': chg_3m, 'chg_6m': chg_6m, 'chg_1y': chg_1y,
             'fib_levels': fib_levels,
             'trend_score': trend_score, 'trend_status': trend_status,
             'daily_data': daily,
             'daily_vol': daily_vol,
         }
+    except Exception as e:
+        print(f"Error Deep Technical: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
     except Exception as e:
         print(f"Error Deep Technical: {e}")
         return None
@@ -956,6 +983,7 @@ Precio Objetivo: Min {fmt_num(a['targetLowPrice'])} | Media {fmt_num(a['targetMe
             prompt += f"""
 
 ═══ ANÁLISIS TÉCNICO ═══
+Etapa de Weinstein: {tech_data.get('weinstein', 'N/D')}
 Tendencia: {tech_data['trend_status']} (Score: {tech_data['trend_score']}/5)
 Precio: {tech_data.get('price', 0):.2f} | EMA9: {tech_data.get('ema_9', 0):.2f} | EMA20: {tech_data.get('ema_20', 0):.2f} | EMA50: {tech_data.get('ema_50', 0):.2f}
 SMA200: {sma200_str}
@@ -1035,117 +1063,741 @@ REGLAS:
         return f"Error en análisis IA: {str(e)}"
 
 
+def get_platform_context():
+    """Recopila el estado actual de la plataforma para darle contexto a AlphaPilot."""
+    ny_now = get_ny_time()
+    ctx = f"FECHA Y HORA ACTUAL (NY): {ny_now.strftime('%A, %b %d, %Y %H:%M')}\n"
+    ctx += "ESTADO ACTUAL DE LA PLATAFORMA:\n"
+    
+    # 1. Ticker Activo
+    if 'last_ticker' in st.session_state:
+        ctx += f"- Ticker en pantalla: {st.session_state['last_ticker']}\n"
+    
+    # 2. Portafolio de la Rueda (Widget Multiselect)
+    if 'wheel_multi_selection_v2' in st.session_state and st.session_state['wheel_multi_selection_v2']:
+        tickers = st.session_state['wheel_multi_selection_v2']
+        ctx += f"- Portafolio Rueda Seleccionado: {', '.join(tickers)}\n"
+        # Si hay un análisis previo, incluir el veredicto
+        if 'wheel_ai_report' in st.session_state and st.session_state['wheel_ai_report']:
+            ctx += f"- El análisis previo de la Rueda sugiere riesgos específicos en esos activos.\n"
+
+    # 3. Datos del Scanner (si existen)
+    if 'scanner_results' in st.session_state and not st.session_state['scanner_results'].empty:
+        top_m = st.session_state['scanner_results'].head(3)['Ticker'].tolist()
+        ctx += f"- Mejores candidatos de Momentum: {', '.join(top_m)}\n"
+
+    # 4. Resultados de Deep Dive
+    if 'dd_ticker_active' in st.session_state:
+        ctx += f"- Deep Dive Activo: {st.session_state['dd_ticker_active']} (Salud: {st.session_state.get('dd_health', {}).get('total', 'N/D')}/100)\n"
+
+    # 6. Bitácora de Operaciones
+    journal_df = market_db.get_journal_entries()
+    if not journal_df.empty:
+        ctx += f"- Bitácora: {len(journal_df)} operaciones guardadas (puedes consultarlas con 'get_user_journal').\n"
+
+    return ctx
+
+def get_wheel_portfolio_details():
+    """Retorna los detalles técnicos de la selección actual del usuario en la estrategia de la Rueda."""
+    if 'wheel_multi_selection_v2' not in st.session_state or not st.session_state['wheel_multi_selection_v2']:
+        return "El usuario no ha seleccionado ningún activo en 'The Wheel' aún."
+    
+    tickers = st.session_state['wheel_multi_selection_v2']
+    df_cache = market_db.get_wheel_cache()
+    if df_cache.empty:
+        return "No hay datos en el historial de la Rueda. El usuario debe ejecutar un escaneo primero."
+    
+    portfolio_df = df_cache[df_cache['Ticker'].isin(tickers)]
+    return portfolio_df.to_json(orient='records')
+
+def get_user_journal():
+    """Retorna la bitácora de operaciones guardadas por el usuario."""
+    df = market_db.get_journal_entries()
+    if df.empty:
+        return "La bitácora de operaciones está vacía."
+    return df.to_json(orient='records')
+
+def get_alpha_pilot_response(api_key, user_input, chat_history):
+    """Genera la respuesta de AlphaPilot usando el contexto de la plataforma y herramientas."""
+    if not api_key: return "⚠️ Configura la API Key en el archivo .env"
+    
+    platform_ctx = get_platform_context()
+    
+    # 1. Definición de Herramientas (Tools)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_ticker_snapshot",
+                "description": "Obtiene el precio actual, cambio del día y rango de precio para un ticker específico.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "ticker": {"type": "string", "description": "Ticker (ej: AMD, TSLA, AAPL)"} },
+                    "required": ["ticker"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_deep_technical_analysis",
+                "description": "Análisis técnico exhaustivo: RSI, MACD, Fibonacci y rendimientos históricos (1d, 5d, 1m, 6m, 1y).",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "ticker": {"type": "string", "description": "Ticker (ej: AAPL)"} },
+                    "required": ["ticker"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_economic_calendar",
+                "description": "Obtiene la agenda económica para un día o periodo específico.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date_str": {"type": "string", "description": "Fecha de inicio (YYYY-MM-DD)."},
+                        "days": {"type": "integer", "description": "Número de días a consultar (ej: 7 para una semana)."}
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_market_news",
+                "description": "Obtiene noticias en tiempo real para un ticker o mercado general.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "ticker": {"type": "string", "description": "Ticker (ej: AAPL) o ^GSPC"} },
+                    "required": ["ticker"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_platform_info",
+                "description": "Obtiene información detallada sobre las funciones de StratEdge Portfolio (Investment Desk, Scanner, etc.)"
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_wheel_portfolio_details",
+                "description": "Obtiene los detalles técnicos (strike, prima, anualizado) de los activos seleccionados por el usuario en 'The Wheel'."
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_user_journal",
+                "description": "Obtiene la bitácora de operaciones guardadas por el usuario en su diario local."
+            }
+        }
+    ]
+    
+    system_prompt = f"""
+    Eres 'AlphaPilot', el Agente Jefe de Estrategia de StratEdge Portfolio. 
+    ESTADO TEMPORAL: {platform_ctx.split('ESTADO ACTUAL')[0].strip()}
+
+    FILOSOFÍA:
+    - Eres un experto en mercados financieros, con un tono profesional, analítico y directo.
+    - Esta es una plataforma institucional para inversores estratégicos de corto y mediano plazo.
+
+    REGLAS DE OPERACIÓN:
+    1. HERRAMIENTAS: Tienes acceso a herramientas para datos en tiempo real. ÚSALAS siempre que el usuario pregunte por precios, noticias, rendimientos o calendario.
+    2. RENDIMIENTOS HISTÓRICOS: Si preguntan por rendimiento de 1 año o periodos largos, usa 'get_deep_technical_analysis'.
+    3. NO MENCIONAR SINTAXIS: Nunca muestres al usuario el nombre de la función ni su sintaxis (ej: no escribas <function=...>); simplemente reporta los datos obtenidos.
+    4. ZERO HALLUCINATION: Si no tienes datos o una herramienta no devuelve lo que buscas, admítelo. No inventes precios ni fechas.
+    5. IDIOMA: Responde exclusivamente en ESPAÑOL.
+    """
+    
+    # Filtrar historial de chat para solo enviar contenido de texto a Groq (evita errores de esquema)
+    clean_history = []
+    for msg in chat_history[-8:]:
+        if isinstance(msg, dict) and 'content' in msg:
+            # Solo enviamos mensajes de usuario y asistente con contenido de texto simple
+            if msg['role'] in ['user', 'assistant']:
+                clean_history.append({"role": msg['role'], "content": msg['content']})
+
+    messages = [{"role": "system", "content": system_prompt}] + clean_history + [{"role": "user", "content": user_input}]
+    
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    
+    try:
+        # Primera llamada para ver si necesita herramientas
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0.2
+        }
+        
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        if resp.status_code != 200:
+            return f"AlphaPilot offline (Error {resp.status_code}). Intenta simplificar tu consulta."
+            
+        resp_data = resp.json()
+        message = resp_data['choices'][0]['message']
+        
+        # 2. Manejo de Tool Calls
+        if 'tool_calls' in message and message['tool_calls']:
+            # Añadir respuesta del asistente que pide las herramientas
+            messages.append(message)
+            
+            for tool_call in message['tool_calls']:
+                func_name = tool_call['function']['name']
+                try:
+                    args = json.loads(tool_call['function']['arguments'])
+                except:
+                    args = {}
+                
+                # Ejecutar función real
+                result_str = ""
+                if func_name == "get_platform_info":
+                    result_str = get_platform_info()
+                
+                elif func_name == "get_ticker_snapshot":
+                    t = args.get('ticker', '').upper()
+                    snap = get_ticker_snapshot(t)
+                    result_str = json.dumps(snap) if isinstance(snap, dict) else str(snap)
+
+                elif func_name == "get_deep_technical_analysis":
+                    t = args.get('ticker', '').upper()
+                    tech = get_deep_technical_analysis(t)
+                    if tech:
+                        # Resumen legible para la IA
+                        result_str = (f"Análisis Técnico {t}:\n"
+                                     f"- Precio: ${tech['price']:.2f}\n"
+                                     f"- Rendimientos: 1D: {tech['chg_1d']:.2f}%, 1M: {tech['chg_1m']:.2f}%, 6M: {tech['chg_6m']:.2f}%, 1Y: {tech['chg_1y']:.2f}%\n"
+                                     f"- RSI: {tech['rsi']:.1f}, Tendencia: {tech['trend_status']}, Weinstein: {tech['weinstein']}")
+                    else:
+                        result_str = f"No se pudo obtener el análisis técnico profundo para {t}."
+
+                elif func_name == "get_economic_calendar":
+                    d_str = args.get('date_str') or dt.now().strftime('%Y-%m-%d')
+                    d_count = max(int(args.get('days') or 7), 1)
+                    df_cal = get_economic_calendar(date_str=d_str, days=d_count)
+                    if not df_cal.empty and 'Error' not in df_cal.columns:
+                        rows = [f"- [{r['Fecha']}] {r['Hora']} - {r['Evento']} (Act: {r['Actual']}, Prev: {r['Previsto']})" for _, r in df_cal.iterrows()]
+                        result_str = "\n".join(rows)
+                    else:
+                        result_str = "No hay eventos económicos relevantes."
+                
+                elif func_name == "get_market_news":
+                    ticker = args.get('ticker', '^GSPC').upper()
+                    result_str = f"NOTICIAS PARA {ticker}:\n" + get_market_news(ticker)
+                
+                elif func_name == "get_wheel_portfolio_details":
+                    result_str = get_wheel_portfolio_details()
+                
+                elif func_name == "get_user_journal":
+                    result_str = get_user_journal()
+                
+                # Enviar resultado de vuelta
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call['id'],
+                    "name": func_name,
+                    "content": result_str
+                })
+            
+            # Segunda llamada con los resultados de las herramientas
+            final_payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "temperature": 0.2
+            }
+            final_resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=final_payload, timeout=30)
+            if final_resp.status_code == 200:
+                return final_resp.json()['choices'][0]['message']['content']
+            else:
+                return "Tuve un problema procesando los datos técnicos. ¿Podrías repetirme la pregunta?"
+        
+        return message.get('content', "No pude procesar esa solicitud.")
+
+    except Exception as e:
+        return f"Error de conexión con AlphaPilot: {str(e)}"
+
+    except Exception as e:
+        return f"Error de conexión con AlphaPilot: {e}"
+
+
+def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
+    """Realiza un análisis estratégico de un portafolio de la Rueda usando IA."""
+    if not api_key: return "Configura la API Key para el análisis."
+
+    
+    portfolio_summary = []
+    total_collateral = 0
+    sectors = {}
+    
+    for _, row in portfolio_df.iterrows():
+        ticker = row['Ticker']
+        sectors[row['Sector']] = sectors.get(row['Sector'], 0) + 1
+        collateral = row['Capital Requerido']
+        total_collateral += collateral
+        portfolio_summary.append(
+            f"- {ticker}: Strike ${row['Strike']}, Prima ${row['Prima']}, Retorno Anual {row['Anualizado']}, Sector {row['Sector']}, Salud {row['Salud']}"
+        )
+    
+    sector_str = ", ".join([f"{k} ({v})" for k, v in sectors.items()])
+    
+    prompt = f"""
+    Eres un experto en gestión de riesgos y estrategias de opciones (The Wheel). 
+    Analiza este portafolio de Cash Secured Puts:
+    
+    CAPITAL TOTAL: ${total_budget:,.2f}
+    CAPITAL COMPROMETIDO: ${total_collateral:,.2f} ({(total_collateral/total_budget)*100:.1f}%)
+    DIVERSIFICACIÓN SECTORIAL: {sector_str}
+    
+    ACTIVOS SELECCIONADOS:
+    {chr(10).join(portfolio_summary)}
+    
+    OBJETIVO DEL ANÁLISIS:
+    1. CONCENTRACIÓN: ¿Hay demasiada exposición a un solo sector o activo?
+    2. RIESGO SISTÉMICO: ¿Cómo se comportaría este portafolio ante una caída del 10% del S&P 500?
+    3. SALUD FINANCIERA: ¿Son empresas robustas para mantener en caso de asignación?
+    4. VERDICTO ESTRATÉGICO: Asigna una calificación del 1 al 10 al riesgo y da un veredicto formal.
+    
+    Responde en Español, con un tono profesional y directo. Usa Markdown.
+    """
+    
+    try:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.4,
+            "max_tokens": 1500
+        }
+        resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
+        if resp.status_code == 200:
+            return resp.json()['choices'][0]['message']['content']
+        return "Error en la comunicación con la IA."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def calculate_delta(S, K, T, r, sigma, option_type='put'):
+    """Calcula el Delta de una opción usando Black-Scholes."""
+    if T <= 0 or sigma <= 0:
+        return 0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    if option_type == 'call':
+        return norm.cdf(d1)
+    else:
+        return norm.cdf(d1) - 1
+
+def get_wheel_recommendations(budget, max_price_filter=None):
+    """
+    Busca las mejores acciones para iniciar 'La Rueda' (Cash Secured Puts).
+    Filtra por capital, Salud Financiera y Etapa de Weinstein.
+    """
+    results = []
+    # Usamos un subconjunto representativo para no saturar
+    WHEEL_UNIVERSE = SCANNER_UNIVERSE 
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total = len(WHEEL_UNIVERSE)
+    
+    # Tasa libre de riesgo (aproximada 4.5% para el cálculo de Delta)
+    r = 0.045
+    
+    for i, ticker in enumerate(WHEEL_UNIVERSE):
+        # progress_bar.progress((i + 1) / total)
+        # status_text.caption(f"Analizando {ticker} para Ciclo de Rueda... ({i+1}/{total})")
+        # Esta parte ya no se usa secuencialmente, se reemplaza por el ThreadPoolExecutor de abajo
+        pass
+        
+        try:
+            t = yf.Ticker(ticker)
+            # Primero filtro rápido por precio
+            fast_info = t.fast_info
+            curr_price = fast_info.get('last_price', 0)
+            
+            if curr_price == 0: continue
+            the_max_p = max_price_filter if max_price_filter else (budget / 100)
+            if curr_price > the_max_p:
+                continue
+                
+            # Filtro por Weinstein (necesitamos historial)
+            hist = t.history(period='1y', interval='1d', auto_adjust=True)
+            w_stage = get_weinstein_stage(hist)
+            
+            # Solo Etapas de Acumulación (1) o Tendencia Alcista (2)
+            if "1" not in str(w_stage) and "2" not in str(w_stage):
+                continue
+                
+            # Filtro por Salud Financiera (Necesitamos financials)
+            fin_data = get_deep_financials(ticker)
+            health = calculate_financial_health_score(fin_data)
+            
+            if health['total'] < 65: # Un poco más flexible para el escáner inicial
+                continue
+                
+            # --- BÚSQUEDA DE OPCIÓN (CASH SECURED PUT) ---
+            expirations = t.options
+            if not expirations: continue
+            
+            # Buscamos vencimiento entre 25 y 50 días
+            target_date = None
+            today = dt.now()
+            for exp in expirations:
+                exp_dt = dt.strptime(exp, '%Y-%m-%d')
+                days_to_exp = (exp_dt - today).days
+                if 25 <= days_to_exp <= 55:
+                    target_date = exp
+                    T = days_to_exp / 365.0
+                    break
+            
+            if not target_date: continue
+            
+            opts = t.option_chain(target_date)
+            puts = opts.puts
+            
+            # Buscamos el strike que tenga un Delta cercano a -0.30
+            # Como no tenemos el Delta directo del API filtrado, lo calculamos
+            best_put = None
+            min_delta_diff = float('inf')
+            
+            for index, put in puts.iterrows():
+                strike = put['strike']
+                iv = put['impliedVolatility']
+                
+                # Omitir strikes muy ITM o sin liquidez
+                if strike >= curr_price or iv < 0.01: continue
+                
+                calc_d = calculate_delta(curr_price, strike, T, r, iv, 'put')
+                
+                # Buscamos el que esté más cerca de Delta -0.30
+                diff = abs(calc_d - (-0.30))
+                if diff < min_delta_diff:
+                    min_delta_diff = diff
+                    best_put = put
+                    best_put['delta'] = calc_d
+            
+            if best_put is not None:
+                premium = (best_put['bid'] + best_put['ask']) / 2
+                if premium <= 0: premium = best_put['lastPrice']
+                
+                # Retorno de la operación (Yield)
+                # Strike * 100 es el colateral
+                collateral = best_put['strike'] * 100
+                yield_pct = (premium * 100 / collateral) * 100
+                
+                # Anualizado
+                days_to_exp = (dt.strptime(target_date, '%Y-%m-%d') - today).days
+                annualized = (yield_pct / days_to_exp) * 365
+                
+                results.append({
+                    'Ticker': ticker,
+                    'Sector': fin_data['general'].get('sector', 'N/D'),
+                    'Precio': round(curr_price, 2),
+                    'W Stage': w_stage,
+                    'Salud': f"{health['total']}/100",
+                    'Strike': best_put['strike'],
+                    'Delta': round(best_put['delta'], 2),
+                    'Prima': round(premium, 2),
+                    'Capital Requerido': collateral,
+                    'Retorno': f"{yield_pct:.2f}%",
+                    'Anualizado': f"{annualized:.1f}%",
+                    'Vencimiento': target_date
+                })
+                
+        except Exception as e:
+            print(f"Error analizando {ticker} para el ciclo de rueda: {e}")
+            
+    progress_bar.empty()
+    status_text.empty()
+    return pd.DataFrame(results)
+
 # --- MOMENTUM SCANNER ---
 SCANNER_UNIVERSE = [
-    'GLD', 'XBI', 'XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY', 'XOP',
-    'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'BRK-B', 'AVGO', 'JPM',
-    'LLY', 'V', 'UNH', 'MA', 'XOM', 'COST', 'HD', 'PG', 'JNJ', 'ABBV',
-    'WMT', 'NFLX', 'CRM', 'BAC', 'ORCL', 'CVX', 'KO', 'MRK', 'AMD', 'PEP',
-    'TMO', 'CSCO', 'ACN', 'LIN', 'ADBE', 'MCD', 'ABT', 'WFC', 'DHR', 'PM',
-    'NOW', 'TXN', 'QCOM', 'INTU', 'ISRG', 'CAT', 'IBM', 'GE', 'AMAT', 'AMGN',
-    'VZ', 'BKNG', 'AXP', 'MS', 'GS', 'SPGI', 'BLK', 'PFE', 'T', 'LOW',
-    'NEE', 'UNP', 'RTX', 'HON', 'SYK', 'DE', 'BA', 'LMT', 'SBUX', 'MMM',
-    'GILD', 'MDLZ', 'ADI', 'LRCX', 'KLAC', 'PANW', 'SNPS', 'CDNS', 'MRVL', 'CRWD',
-    'PLTR', 'COIN', 'SQ', 'SHOP', 'SNOW', 'DKNG', 'MELI', 'MU', 'INTC', 'PYPL',
-    'ABNB', 'ARM', 'SMCI', 'DASH', 'UBER', 'NET', 'ZS', 'RBLX', 'ENPH', 'RIVN',
-    'SOFI', 'SNAP', 'HOOD', 'CLSK', 'MARA', 'RIOT', 'F', 'AAL', 'VALE', 'NIO',
-    'PARA', 'PINS', 'UPST', 'AFRM', 'AI', 'PLUG', 'RUN', 'BABA', 'JD', 'CPNG',
-    'GRAB', 'SE', 'NU', 'DLO', 'U', 'ROKU', 'GME', 'XPEV', 'LI', 'FUTU'
+    # Índices y ETFs (Líquidos para Opciones)
+    'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLV', 'XLY', 'XLE', 'XLI', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC',
+    'SMH', 'SOXX', 'IBB', 'XBI', 'GLD', 'SLV', 'TLT', 'EEM', 'GDX', 'KRE', 'XOP', 'XRT', 'TAN', 'ARKK',
+    # Tecnología / Megacaps (Líquidos)
+    'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'NFLX', 'AVGO', 'CSCO', 'ADBE', 'ORCL', 'CRM', 
+    'AMD', 'INTC', 'TXN', 'QCOM', 'MU', 'AMAT', 'LRCX', 'ADI', 'PANW', 'FTNT', 'CRWD', 'SNPS', 'CDNS',
+    'SHOP', 'SQ', 'PYPL', 'PLTR', 'SNOW', 'MDB', 'TEAM', 'WDAY', 'NOW', 'DDOG', 'ZS', 'OKTA', 'NET', 'DOCU',
+    # Consumo / Retail
+    'WMT', 'COST', 'HD', 'LOW', 'TGT', 'NKE', 'SBUX', 'MCD', 'COKE', 'PEP', 'PG', 'CL', 'EL', 'PM', 'MO',
+    'LULU', 'TJX', 'MAR', 'HLT', 'BKNG', 'ABNB', 'DASH', 'UBER', 'LYFT', 'RIVN', 'LCID', 'F', 'GM',
+    # Financiero
+    'JPM', 'BAC', 'GS', 'MS', 'AXP', 'V', 'MA', 'COF', 'C', 'WFC', 'BLK', 'SPGI', 'MCO', 'PYPL', 'HOOD', 'COIN',
+    # Salud / Pharma
+    'LLY', 'UNH', 'JNJ', 'PFE', 'ABBV', 'MRK', 'AMGN', 'GILD', 'BMY', 'VRTX', 'REGN', 'ISRG', 'TMO', 'DHR',
+    # Energía / Materiales / Industrials
+    'XOM', 'CVX', 'SLB', 'COP', 'OXY', 'CAT', 'DE', 'GE', 'HON', 'MMM', 'UPS', 'FDX', 'LMT', 'RTX', 'BA', 'NOC',
+    'LIN', 'APD', 'FCX', 'NEM', 'NUE', 'AA', 'VALE', 'BHP', 'RIO',
+    # Otros Growth / Mid-Cap / Relevantes
+    'MELI', 'BABA', 'JD', 'PDD', 'SE', 'CPNG', 'NU', 'DKNG', 'PINS', 'SNAP', 'ROKU', 'U', 'RBLX', 'MSTR', 'MARA', 'RIOT',
+    'AFRM', 'UPST', 'SOFI', 'AI', 'ARM', 'SMCI', 'PLUG', 'RUN', 'ENPH', 'FSLR', 'TSM', 'ASML', 'GME', 'AMC'
 ]
 
+# Añadir más S&P 500 para llegar a ~260 (Top de Market Cap adicional)
+ADDITIONAL_UNIVERSE = [
+    'T', 'VZ', 'TMUS', 'DIS', 'CMCSA', 'CHTR', 'NFLX', 'SNE', 'PARA', 'WBD',
+    'ADP', 'PAYX', 'FIS', 'FISV', 'GPN', 'INTU', 'ADSK', 'ANSS', 'TEAM', 'ZM',
+    'SYK', 'BSX', 'EW', 'ZTS', 'IDXX', 'ALGN', 'A', 'STZ', 'BF-B', 'KDP', 'MDLZ',
+    'K', 'GIS', 'CPB', 'SJM', 'HSY', 'ADM', 'TSN', 'KHC', 'SYY', 'TFC', 'USB', 'PNC', 
+    'TROW', 'MET', 'PRU', 'AIG', 'TRV', 'CB', 'CME', 'ICE', 'ETN', 'ITW', 'EMR',
+    'WM', 'RSG', 'NSC', 'UNP', 'CSX', 'ODFL', 'MAR', 'EXPE', 'CCL', 'RCL', 'NCLH',
+    'DHR', 'A', 'TMO', 'WAT', 'VTRS', 'HCA', 'HUM', 'CI', 'CVS', 'CNC', 'MCK', 'ABC',
+    'EOG', 'PXD', 'MPC', 'PSX', 'VLO', 'HES', 'DVN', 'FANG', 'O', 'AMT', 'CCI', 'PLD',
+    'EQIX', 'PSA', 'DLR', 'VICI', 'WY', 'SPG', 'AVB', 'EQR'
+]
+
+SCANNER_UNIVERSE = sorted(list(set(SCANNER_UNIVERSE + ADDITIONAL_UNIVERSE)))
+
+def analyze_single_ticker_wheel(ticker, budget, max_price_filter, r=0.045):
+    """Función auxiliar para procesar un solo ticker en paralelo."""
+    try:
+        t = yf.Ticker(ticker)
+        # Intentar obtener precio rápido
+        fast_info = t.fast_info
+        curr_price = fast_info.get('last_price', 0) if hasattr(fast_info, 'get') else 0
+        
+        # Obtener historial para Weinstein y como fallback de precio
+        hist = t.history(period='1y', interval='1d', auto_adjust=True)
+        if hist.empty or len(hist) < 150:
+            return None
+            
+        if curr_price == 0:
+            curr_price = hist['Close'].iloc[-1]
+            
+        if curr_price == 0: return None
+        
+        # Filtros de precio: Siempre escaneamos hasta $500 para llenar la base de datos
+        # El filtrado específico se hace después en la UI
+        if curr_price > 500:
+            return None
+            
+        w_stage = get_weinstein_stage(hist)
+        # Permitir Etapa 1, 2 y Transición
+        if "1" not in str(w_stage) and "2" not in str(w_stage) and "Transición" not in str(w_stage):
+            return None
+            
+        fin_data = get_deep_financials(ticker)
+        health = calculate_financial_health_score(fin_data)
+        if health['total'] < 50:
+            return None
+            
+        print(f"DEBUG Wheel: {ticker} pasó filtros iniciales. Analizando opciones...")
+            
+        expirations = t.options
+        if not expirations: return None
+        
+        target_date = None
+        today = dt.now()
+        for exp in expirations:
+            try:
+                exp_dt = dt.strptime(exp, '%Y-%m-%d')
+                days_to_exp = (exp_dt - today).days
+                # Rango de 15 a 70 días para ser más flexible
+                if 15 <= days_to_exp <= 70:
+                    target_date = exp
+                    T = days_to_exp / 365.0
+                    break
+            except:
+                continue
+        
+        if not target_date: return None
+        
+        opts = t.option_chain(target_date)
+        puts = opts.puts
+        
+        best_put = None
+        min_delta_diff = float('inf')
+        
+        for index, put in puts.iterrows():
+            strike = put['strike']
+            iv = put['impliedVolatility']
+            if strike >= curr_price or iv < 0.01: continue
+            
+            calc_d = calculate_delta(curr_price, strike, T, r, iv, 'put')
+            diff = abs(calc_d - (-0.30))
+            if diff < min_delta_diff:
+                min_delta_diff = diff
+                best_put = put
+                best_put['delta'] = calc_d
+        
+        if best_put is not None:
+            premium = (best_put['bid'] + best_put['ask']) / 2
+            if premium <= 0: premium = best_put['lastPrice']
+            
+            collateral = best_put['strike'] * 100
+            yield_pct = (premium * 100 / collateral) * 100
+            days_to_exp = (dt.strptime(target_date, '%Y-%m-%d') - today).days
+            annualized = (yield_pct / days_to_exp) * 365
+            
+            return {
+                'Ticker': ticker,
+                'Sector': fin_data['general'].get('sector', 'N/D'),
+                'Precio': round(curr_price, 2),
+                'W Stage': w_stage,
+                'Salud': f"{health['total']}/100",
+                'Strike': best_put['strike'],
+                'Delta': round(best_put['delta'], 2),
+                'Prima': round(premium, 2),
+                'Capital Requerido': collateral,
+                'yield_pct': yield_pct,
+                'annualized': annualized,
+                'Retorno': f"{yield_pct:.2f}%",
+                'Anualizado': f"{annualized:.1f}%",
+                'Vencimiento': target_date
+            }
+    except Exception as e:
+        print(f"ERROR Wheel {ticker}: {e}")
+    return None
+
+def get_wheel_recommendations(budget, max_price_filter=None):
+    """
+    Busca las mejores acciones para iniciar 'La Rueda' (Cash Secured Puts).
+    USA MULTITHREADING para procesar ~250 activos rápidamente.
+    """
+    results = []
+    WHEEL_UNIVERSE = SCANNER_UNIVERSE 
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(WHEEL_UNIVERSE)
+    
+    # Procesamiento en paralelo (12 hilos)
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {executor.submit(analyze_single_ticker_wheel, ticker, budget, max_price_filter): ticker for ticker in WHEEL_UNIVERSE}
+        
+        for i, future in enumerate(futures):
+            ticker = futures[future]
+            res = future.result()
+            if res:
+                results.append(res)
+            
+            progress_bar.progress((i + 1) / total)
+            status_text.caption(f"Procesando {ticker}... ({i+1}/{total})")
+            
+    progress_bar.empty()
+    status_text.empty()
+    return pd.DataFrame(results)
+
+
+def analyze_single_ticker_momentum(ticker, price_min, price_max, min_volume, smooth_momentum=False):
+    """Procesa un solo ticker para el escáner de momentum."""
+    try:
+        t = yf.Ticker(ticker)
+        # 1y para Weinstein (SMA 150)
+        hist = t.history(period='1y', interval='1d', auto_adjust=True)
+        if hist.empty or len(hist) < 20:
+            return None
+        
+        # Aplanar si es MultiIndex
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0)
+
+        price = hist['Close'].iloc[-1]
+        # Filtro de precio
+        if price < price_min or price > price_max:
+            return None
+        
+        # Filtro de volumen
+        avg_vol = hist['Volume'].tail(20).mean()
+        if avg_vol < min_volume:
+            return None
+        
+        # Calcular etapa de Weinstein
+        w_stage = get_weinstein_stage(hist)
+
+        # Calcular indicadores técnicos
+        ema_20 = hist['Close'].ewm(span=20).mean().iloc[-1]
+        ema_50 = hist['Close'].ewm(span=50).mean().iloc[-1]
+        
+        # RSI
+        delta = hist['Close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = (100 - (100 / (1 + rs))).iloc[-1]
+        
+        # Cambios porcentuales
+        chg_1d = ((price / hist['Close'].iloc[-2]) - 1) * 100 if len(hist) > 1 else 0
+        chg_5d = ((price / hist['Close'].iloc[-6]) - 1) * 100 if len(hist) > 5 else 0
+        chg_20d = ((price / hist['Close'].iloc[-21]) - 1) * 100 if len(hist) > 20 else 0
+        
+        # Volumen relativo (hoy vs promedio)
+        vol_today = hist['Volume'].iloc[-1]
+        vol_ratio = vol_today / avg_vol if avg_vol > 0 else 0
+        
+        # Volatilidad (Desviación estándar de retornos diarios - 20 días)
+        daily_vol = hist['Close'].pct_change().tail(20).std()
+
+        # Momentum Score (0-100)
+        score = 0
+        # Precio > EMA 20 (+20)
+        if price > ema_20: score += 20
+        # EMA 20 > EMA 50 (+20)
+        if ema_20 > ema_50: score += 20
+        # RSI entre 50-70 (+20) o >70 (+10)
+        if 50 <= rsi <= 70: score += 20
+        elif rsi > 70: score += 10
+        # Cambio 5d positivo (+20)
+        if chg_5d > 0: score += 20
+        # Volumen superior al promedio (+20)
+        if vol_ratio > 1.0: score += 20
+        
+        # --- FILTRO DE MOMENTUM SUAVE (Baja Volatilidad) ---
+        if smooth_momentum:
+            # Si la volatilidad diaria es baja (< 2%), premiamos la estabilidad
+            if daily_vol < 0.02: 
+                score += 20
+            # Si es muy alta (> 4%), penalizamos fuertemente
+            elif daily_vol > 0.04:
+                score -= 40
+
+        # Solo incluir si tiene mínimo 40 de score
+        if score >= 40:
+            return {
+                'Ticker': ticker,
+                'Precio': round(price, 2),
+                'Etapa W': w_stage,
+                '1D%': round(chg_1d, 2),
+                '5D%': round(chg_5d, 2),
+                '20D%': round(chg_20d, 2),
+                'RSI': round(rsi, 1),
+                'Vol Ratio': round(vol_ratio, 2),
+                'Vol Avg': f"{avg_vol/1e6:.1f}M",
+                'Score': score
+            }
+    except Exception:
+        pass
+    return None
 
 @st.cache_data(ttl=900, show_spinner=False)
 def scan_momentum_stocks(price_min, price_max, min_volume, smooth_momentum=False):
-
-    """Escanea el universo de acciones buscando momentum alcista."""
+    """Escanea el universo de acciones buscando momentum alcista usando Multithreading."""
     results = []
     progress_text = st.empty()
     progress_bar = st.progress(0)
     total = len(SCANNER_UNIVERSE)
     
-    for i, ticker in enumerate(SCANNER_UNIVERSE):
-        progress_bar.progress((i + 1) / total)
-        progress_text.caption(f"Escaneando {ticker}... ({i+1}/{total})")
-        try:
-            t = yf.Ticker(ticker)
-            hist = t.history(period='3mo', interval='1d', auto_adjust=True)
-            if hist.empty or len(hist) < 20:
-                continue
+    # Procesamiento en paralelo (15 hilos)
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        futures = {executor.submit(analyze_single_ticker_momentum, ticker, price_min, price_max, min_volume, smooth_momentum): ticker for ticker in SCANNER_UNIVERSE}
+        
+        for i, future in enumerate(futures):
+            ticker = futures[future]
+            res = future.result()
+            if res:
+                results.append(res)
             
-            price = hist['Close'].iloc[-1]
-            # Filtro de precio
-            if price < price_min or price > price_max:
-                continue
+            progress_bar.progress((i + 1) / total)
+            progress_text.caption(f"Escaneando {ticker}... ({i+1}/{total})")
             
-            # Filtro de volumen
-            avg_vol = hist['Volume'].tail(20).mean()
-            if avg_vol < min_volume:
-                continue
-            
-            # Calcular indicadores técnicos
-            ema_20 = hist['Close'].ewm(span=20).mean().iloc[-1]
-            ema_50 = hist['Close'].ewm(span=50).mean().iloc[-1]
-            
-            # RSI
-            delta = hist['Close'].diff()
-            gain = delta.where(delta > 0, 0).rolling(14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-            rs = gain / loss.replace(0, np.nan)
-            rsi = (100 - (100 / (1 + rs))).iloc[-1]
-            
-            # Cambios porcentuales
-            chg_1d = ((price / hist['Close'].iloc[-2]) - 1) * 100 if len(hist) > 1 else 0
-            chg_5d = ((price / hist['Close'].iloc[-6]) - 1) * 100 if len(hist) > 5 else 0
-            chg_20d = ((price / hist['Close'].iloc[-21]) - 1) * 100 if len(hist) > 20 else 0
-            
-            # Volumen relativo (hoy vs promedio)
-            vol_today = hist['Volume'].iloc[-1]
-            vol_ratio = vol_today / avg_vol if avg_vol > 0 else 0
-            
-            # Volatilidad (Desviación estándar de retornos diarios - 20 días)
-            daily_vol = hist['Close'].pct_change().tail(20).std()
-
-            
-            # Momentum Score (0-100)
-            score = 0
-            # Precio > EMA 20 (+20)
-            if price > ema_20: score += 20
-            # EMA 20 > EMA 50 (+20)
-            if ema_20 > ema_50: score += 20
-            # RSI entre 50-70 (+20) o >70 (+10)
-            if 50 <= rsi <= 70: score += 20
-            elif rsi > 70: score += 10
-            # Cambio 5d positivo (+20)
-            if chg_5d > 0: score += 20
-            # Volumen superior al promedio (+20)
-            if vol_ratio > 1.0: score += 20
-            
-            # --- FILTRO DE MOMENTUM SUAVE (Baja Volatilidad) ---
-            if smooth_momentum:
-                # Si la volatilidad diaria es baja (< 2%), premiamos la estabilidad
-                if daily_vol < 0.02: 
-                    score += 20
-                # Si es muy alta (> 4%), penalizamos fuertemente
-                elif daily_vol > 0.04:
-                    score -= 40
-
-            
-            # Solo incluir si tiene mínimo 40 de score
-            if score >= 40:
-                results.append({
-                    'Ticker': ticker,
-                    'Precio': round(price, 2),
-                    '1D%': round(chg_1d, 2),
-                    '5D%': round(chg_5d, 2),
-                    '20D%': round(chg_20d, 2),
-                    'RSI': round(rsi, 1),
-                    'Vol Ratio': round(vol_ratio, 2),
-                    'Vol Avg': f"{avg_vol/1e6:.1f}M",
-                    'Score': score
-                })
-        except Exception:
-            continue
-    
     progress_bar.empty()
     progress_text.empty()
     
@@ -1281,10 +1933,8 @@ def get_pre_market_briefing(api_key, context_data, news_text, calendar_text=""):
     Eres el ESTRATEGA JEFE de un Fondo de Cobertura. Redacta el BRIEFING PRE-MERCADO para tus traders.
     
     1. CONTEXTO TÉCNICO:
-    - Sentimiento IA: {context_data.get('prediction', 'N/A')}
     - Radar Opciones: {context_data.get('options_sent', 'N/A')} (P/C: {context_data.get('pc_ratio', 'N/A')})
     - Muros Clave: Call {context_data.get('call_wall', 'N/A')} / Put {context_data.get('put_wall', 'N/A')}
-    - VIX/Riesgo: {context_data.get('risk', 'N/A')}
     
     2. ÚLTIMAS NOTICIAS:
     {news_text}
@@ -1341,18 +1991,6 @@ class MarketDB:
                 )
             ''')
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS predictions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ticker TEXT,
-                    prediction_date TEXT,
-                    execution_date TEXT,
-                    prediction_value INTEGER,
-                    prob_up REAL,
-                    prob_down REAL,
-                    is_backtest INTEGER
-                )
-            ''')
-            cursor.execute('''
                 CREATE TABLE IF NOT EXISTS journal (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     ticker TEXT,
@@ -1373,10 +2011,71 @@ class MarketDB:
             except:
                 pass 
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS wheel_cache (
+                    ticker TEXT PRIMARY KEY,
+                    sector TEXT,
+                    price REAL,
+                    w_stage TEXT,
+                    health TEXT,
+                    strike REAL,
+                    delta REAL,
+                    premium REAL,
+                    collateral REAL,
+                    yield_pct REAL,
+                    annualized REAL,
+                    expiration TEXT,
+                    last_updated TEXT
+                )
+            ''')
             conn.commit()
             conn.close()
         except Error as e:
             print(f"DB Error: {e}")
+
+    def save_wheel_results(self, df):
+        if df.empty: return
+        try:
+            conn = sqlite3.connect(self.db_file)
+            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            for _, row in df.iterrows():
+                # Limpiar % de las cadenas si subieron como string
+                y_val = float(str(row['Retorno']).replace('%', '')) if isinstance(row['Retorno'], str) else row['Retorno']
+                a_val = float(str(row['Anualizado']).replace('%', '')) if isinstance(row['Anualizado'], str) else row['Anualizado']
+                
+                conn.execute('''
+                    INSERT OR REPLACE INTO wheel_cache 
+                    (ticker, sector, price, w_stage, health, strike, delta, premium, collateral, yield_pct, annualized, expiration, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    row['Ticker'], row['Sector'], row['Precio'], row['W Stage'], row['Salud'],
+                    row['Strike'], row['Delta'], row['Prima'], row['Capital Requerido'],
+                    y_val, a_val, row['Vencimiento'], now
+                ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving wheel cache: {e}")
+
+    def get_wheel_cache(self):
+        try:
+            conn = sqlite3.connect(self.db_file)
+            df = pd.read_sql_query("SELECT * FROM wheel_cache ORDER BY annualized DESC", conn)
+            conn.close()
+            # Restaurar formatos para la UI
+            if not df.empty:
+                df['Retorno'] = df['yield_pct'].apply(lambda x: f"{x:.2f}%")
+                df['Anualizado'] = df['annualized'].apply(lambda x: f"{x:.1f}%")
+                # Renombrar columnas para consistencia con la lógica existente
+                df = df.rename(columns={
+                    'ticker': 'Ticker', 'sector': 'Sector', 'price': 'Precio',
+                    'w_stage': 'W Stage', 'health': 'Salud', 'strike': 'Strike',
+                    'delta': 'Delta', 'premium': 'Prima', 'collateral': 'Capital Requerido',
+                    'expiration': 'Vencimiento', 'last_updated': 'Última Actualización'
+                })
+            return df
+        except:
+            return pd.DataFrame()
 
     def get_last_date(self, ticker):
         conn = sqlite3.connect(self.db_file)
@@ -1436,26 +2135,6 @@ class MarketDB:
             del df['ticker']
         return df
 
-    def save_prediction(self, ticker, pred_date, pred_val, p_up, p_down, is_backtest=0):
-        try:
-            conn = sqlite3.connect(self.db_file)
-            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
-            p_date_str = pred_date.strftime('%Y-%m-%d') if hasattr(pred_date, 'strftime') else str(pred_date)
-            conn.execute('''
-                INSERT INTO predictions (ticker, prediction_date, execution_date, prediction_value, prob_up, prob_down, is_backtest)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (ticker, p_date_str, now, int(pred_val), float(p_up), float(p_down), int(is_backtest)))
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"Error saving prediction: {e}")
-
-    def get_predictions(self, ticker, limit=10):
-        conn = sqlite3.connect(self.db_file)
-        query = f"SELECT * FROM predictions WHERE ticker='{ticker}' ORDER BY id DESC LIMIT {limit}"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
 
     def save_journal_entry(self, ticker, price, score, verdict, reasoning, sl=0.0, tp=0.0):
         conn = None
@@ -1474,6 +2153,21 @@ class MarketDB:
             tp_val = float(tp)
             
             cursor = conn.cursor()
+            
+            # --- VERIFICACIÓN DE DUPLICADOS ---
+            # Evitar guardar la misma operación múltiples veces (mismo ticker, día, precio y razonamiento)
+            check_query = '''
+                SELECT id FROM journal 
+                WHERE ticker = ? 
+                AND date(entry_date) = date(?) 
+                AND (abs(entry_price - ?) < 0.001 AND reasoning = ?)
+            '''
+            cursor.execute(check_query, (t_val, d_val, p_val, r_val))
+            
+            if cursor.fetchone():
+                # Si ya existe, asumimos éxito (idempotencia) para no mostrar error al usuario
+                return True
+
             cursor.execute('''
                 INSERT INTO journal (ticker, entry_date, entry_price, sl_price, tp_price, score, verdict, reasoning, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
@@ -1574,7 +2268,7 @@ def load_data_with_alpha_vantage(ticker, start_date, end_date, api_key):
 
         # ANÁLISIS INTERMARKET (Consistente con Yahoo)
         try:
-            st.info("🌐 Analizando mercados globales (Oro + Petróleo + VIX)...")
+
             s_str_m = datos.index[0].strftime('%Y-%m-%d')
             e_str_m = datos.index[-1].strftime('%Y-%m-%d')
             
@@ -1661,7 +2355,7 @@ def load_data_with_yahoo(ticker, start_date, end_date, max_retries=3):
                         new_data.columns = new_data.columns.get_level_values(0)
                     
                     market_db.save_data(new_data, ticker)
-                    st.sidebar.success(f"✅ DB actualizada con últimos datos.")
+
                     break
             except Exception as e:
                 print(f"Error sync: {e}")
@@ -1719,7 +2413,7 @@ def load_data_with_yahoo(ticker, start_date, end_date, max_retries=3):
 
         # ANÁLISIS INTERMARKET (Oro + Petróleo + Macro)
         try:
-            st.info("🌐 Analizando mercados globales (Oro + Petróleo + VIX)...")
+
             vix_data = yf.download("^VIX", start=s_str, end=e_str, progress=False, auto_adjust=False)
             tnx_data = yf.download("^TNX", start=s_str, end=e_str, progress=False, auto_adjust=False)
             gold_data = yf.download("GC=F", start=s_str, end=e_str, progress=False, auto_adjust=False)
@@ -1770,441 +2464,61 @@ def load_data_with_yahoo(ticker, start_date, end_date, max_retries=3):
         st.error(f"Error procesando indicadores técnicos: {str(e)}")
         return None
 
-# Entrenar modelo avanzado con XGBoost - Versión de Alto Rendimiento 3.0
-def train_model(data):
-    features = GLOBAL_FEATURES
-    
-    # Limpieza final
-    df = data.copy()
-    df = df.replace([np.inf, -np.inf], np.nan)
-    available_features = [f for f in features if f in df.columns]
-    df = df.dropna(subset=available_features + ['Target'])
-    
-    if len(df) < 100:
-        raise ValueError("No hay suficientes datos limpios.")
 
-    X = df[available_features]
-    y = df['Target']
-
-    # 1. Ponderación Temporal (0.5 a 1.0) para dar más peso a lo reciente (más agresivo)
-    sample_weights = np.linspace(0.5, 1.0, len(y))
-
-    # Split cronológico
-    split_idx = int(len(X) * 0.85)
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    w_train = sample_weights[:split_idx]
-
-    # Búsqueda Maestra de Parámetros (GridSearch) y Ensamble de Comité
-    pos_weight_calc = (len(y_train) - sum(y_train)) / sum(y_train) if sum(y_train) > 0 else 1.0
-    
-    # 1. XGBoost
-    xgb = XGBClassifier(
-        n_estimators=300, max_depth=4, learning_rate=0.03, 
-        scale_pos_weight=pos_weight_calc, random_state=42, eval_metric='logloss'
-    )
-    
-    # 2. Random Forest
-    rf = RandomForestClassifier(n_estimators=300, max_depth=6, random_state=42)
-    
-    # 3. Gradient Boosting (Sustituto de LightGBM por robustez)
-    gb = GradientBoostingClassifier(n_estimators=200, learning_rate=0.05, max_depth=4, random_state=42)
-
-    # El Comité de Votación (Soft Voting usa las probabilidades para promediar)
-    ensemble = VotingClassifier(
-        estimators=[('xgb', xgb), ('rf', rf), ('gb', gb)],
-        voting='soft'
-    )
-    
-    ensemble.fit(X_train, y_train, sample_weight=w_train)
-
-    return ensemble, X_test, y_test
-
-# Evaluar modelo
-def evaluate_model(model, X_test, y_test):
-    # Asegurar que no haya nulos o inf en el set de prueba
-    clean_idx = np.isfinite(X_test).all(axis=1)
-    X_test_clean = X_test[clean_idx]
-    y_test_clean = y_test[clean_idx]
-    
-    y_pred = model.predict(X_test_clean)
-    accuracy = accuracy_score(y_test_clean, y_pred)
-    precision = precision_score(y_test_clean, y_pred, zero_division=0)
-    recall = recall_score(y_test_clean, y_pred, zero_division=0)
-    f1 = f1_score(y_test_clean, y_pred, zero_division=0)
-    return accuracy, precision, recall, f1
-
-# Predecir el día siguiente al último día de negociación
-def predict_next_day(model, data):
-    features = GLOBAL_FEATURES
-    stat_text, stat_code = check_market_status()
-
-    # 1. Obtener indicadores del último cierre
-    last_row = data.iloc[-1].copy()
-    last_trading_day = data.index[-1]
-    
-    # 2. Si es Pre-Mercado o Abierto, intentar inyectar datos REAL-TIME
-    if stat_code in ['pre', 'open']:
-        try:
-            # Sincronizar Futuros, Nikkei, DAX, DXY y NYA del momento exacto
-            tickers_intl = {
-                "Nikkei_Return": "^N225", 
-                "DAX_Return": "^GDAXI", 
-                "Futures_Return": "ES=F",
-                "DXY_Return": "DX-Y.NYB",
-                "NYA_Return": "^NYA"
-            }
-            for feat, symb in tickers_intl.items():
-                intl_df = yf.download(symb, period="5d", progress=False, auto_adjust=False)
-                if len(intl_df) >= 2:
-                    current_price = intl_df['Close'].iloc[-1]
-                    prev_close = intl_df['Close'].iloc[-2]
-                    last_row[feat] = (current_price / prev_close) - 1
-        except Exception as e:
-            print(f"DEBUG: Fallo en Live Sync: {e}")
-
-    # --- BLINDAJE ANTI-MISMATCH AVANZADO ---
-    # Detectamos qué columnas espera el modelo realmente
-    model_features = features
-    try:
-        if hasattr(model, 'feature_names_in_'):
-            model_features = list(model.feature_names_in_)
-        elif hasattr(model, 'estimators_') and hasattr(model.estimators_[0], 'feature_names_in_'):
-            model_features = list(model.estimators_[0].feature_names_in_)
-    except:
-        pass
-    
-    # Preparamos el DataFrame con las columnas exactas que el modelo conoce
-    input_df = pd.DataFrame([last_row.reindex(model_features).fillna(0.0)], columns=model_features)
-    
-    try:
-        prediction_proba = model.predict_proba(input_df)[0]
-    except Exception as e:
-        print(f"Error crítico en predict_proba: {e}")
-        return -1, [0.5, 0.5], last_trading_day, {}, "⚠️ Error de sincronización de modelo. Por favor, re-entrena desde el sidebar."
-    
-    # FILTRO DE SEGURIDAD DINÁMICO
-    prob_up = prediction_proba[1]
-    prob_down = prediction_proba[0]
-    adx_val = last_row.get('ADX', 0)
-    
-    # Si no hay tendencia (ADX bajo), exigimos más confianza para evitar ruido
-    threshold = 0.72 if adx_val < 20 else 0.65
-    
-    if prob_up > threshold:
-        final_prediction = 1
-    elif prob_down > threshold:
-        final_prediction = 0
-    else:
-        final_prediction = -1 # Neutral / Esperar
-    
-    # Determinar fecha objetivo
-    if stat_code in ['pre', 'open']:
-        target_date = get_ny_time()
-    else:
-        target_date = last_trading_day + timedelta(days=1)
-        while target_date.weekday() >= 5:
-            target_date += timedelta(days=1)
-    
-    # Generar Nota de Sesgo Matinal
-    bias_note = ""
-    f_ret = last_row.get('Futures_Return', 0)
-    d_ret = last_row.get('DXY_Return', 0)
-    v_chg = last_row.get('VIX_Change', 0)
-    adx_val = last_row.get('ADX', 0)
-    
-    if stat_code in ['pre', 'open']:
-        direction = "Alcista" if final_prediction == 1 else "Bajista" if final_prediction == 0 else "Neutral"
-        intensity = "Fuerte" if max(prob_up, prob_down) > 0.75 else "Moderado"
-        
-        note = f"**BIAS Matinal:** {direction} {intensity}. "
-        
-        # Inyectar inteligencia de tendencia
-        if adx_val < 20:
-            note += "⚠️ Mercado en rango/lateral (ADX bajo). "
-        elif adx_val > 35:
-            note += "🔥 Tendencia con alta convicción (ADX fuerte). "
-
-        if f_ret > 0.002: note += "Los Futuros muestran optimismo. "
-        elif f_ret < -0.002: note += "Los Futuros indican presión vendedora. "
-        
-        if d_ret > 0.001: note += "El Dólar (DXY) está fuerte (presión bajista). "
-        if v_chg > 0.02: note += "VIX al alza: Volatilidad elevada."
-        
-        # --- GATILLO DE SHORT POR RIESGO DE CRASH ---
-        # Calculamos el riesgo en tiempo real
-        risk_lvl, _, _, _ = calculate_crash_risk(data)
-        if "ALTO" in risk_lvl or "EXTREMO" in risk_lvl:
-            if final_prediction == 0: # Si la IA ya dice bajada
-                note += "\n\n🔥 **OPORTUNIDAD DE SHORT:** Riesgo sistémico elevado + Sesgo bajista. Considera proteger o buscar entradas cortas."
-        
-        bias_note = note
-    else:
-        direction = "Alcista" if final_prediction == 1 else "Bajista" if final_prediction == 0 else "Neutral"
-        bias_note = f"**Sesgo de Cierre:** {direction}. Basado en la configuración histórica."
-
-    # Analizar alineación para el panel visual
-    market_breadth = {
-        'sp500_ret': f_ret if stat_code in ['pre', 'open'] else last_row.get('Returns', 0),
-        'nya_ret': last_row.get('NYA_Return', 0)
-    }
-    
-    return final_prediction, prediction_proba, target_date, market_breadth, bias_note
-
-# Predecir desde una fecha seleccionada para hacer backtesting
-def predict_from_date(model, data, selected_date):
-    features = GLOBAL_FEATURES
-
-    # Convertir a Timestamp y quitar zona horaria para evitar errores de comparación
-    selected_ts = pd.Timestamp(selected_date).tz_localize(None)
-    
-    # Asegurar que el índice de los datos sea naive para la comparación
-    data_naive = data.copy()
-    if data_naive.index.tz is not None:
-        data_naive.index = data_naive.index.tz_localize(None)
-
-    # Filtrar los datos hasta la fecha seleccionada
-    data_until_selected = data_naive.loc[:selected_ts]
-
-    # --- BLINDAJE ANTI-MISMATCH ---
-    # Detectamos qué columnas espera el modelo realmente
-    model_features = features
-    if hasattr(model, 'feature_names_in_'):
-        model_features = list(model.feature_names_in_)
-        
-    last_row = data_until_selected.iloc[-1]
-    last_data_df = pd.DataFrame([last_row.reindex(model_features).fillna(0.0)], columns=model_features)
-
-    prediction = model.predict(last_data_df)
-    prediction_proba = model.predict_proba(last_data_df)
-
-    # Calcular el siguiente día de negociación
-    last_trading_day = data_until_selected.index[-1]
-    next_day = last_trading_day + timedelta(days=1)
-    while next_day.weekday() >= 5:
-        next_day += timedelta(days=1)
-
-    return prediction[0], prediction_proba[0], next_day
-
-def plot_feature_importance(model, features):
-    import plotly.express as px
-    import pandas as pd
-    import numpy as np
-    
-    try:
-        # 1. Caso Ensamble (VotingClassifier)
-        if hasattr(model, 'estimators_'):
-            all_imps = []
-            for est in model.estimators_:
-                # En XGBoost/RF de scikit-learn, feature_importances_ es estándar
-                if hasattr(est, 'feature_importances_'):
-                    all_imps.append(est.feature_importances_)
-            
-            if all_imps:
-                # Promediamos las opiniones de todo el comité
-                importances = np.mean(all_imps, axis=0)
-            else:
-                return None
-        # 2. Caso Modelo Individual
-        elif hasattr(model, 'feature_importances_'):
-            importances = model.feature_importances_
-        else:
-            return None
-
-        # Asegurar nombres de columnas
-        if hasattr(model, 'feature_names_in_'):
-            names = list(model.feature_names_in_)
-        else:
-            names = features[:len(importances)]
-
-        # Crear DataFrame para el gráfico
-        df_imp = pd.DataFrame({
-            'Variable': names, 
-            'Importancia': importances
-        }).sort_values(by='Importancia', ascending=True)
-
-        # Crear gráfica con Plotly
-        fig = px.bar(
-            df_imp, 
-            x='Importancia', 
-            y='Variable', 
-            orientation='h',
-            title='🎯 Relevancia de los Indicadores (Comité de Modelos)',
-            color='Importancia',
-            color_continuous_scale='Viridis',
-            labels={'Importancia': 'Peso en el Consenso'}
-        )
-        
-        fig.update_layout(
-            height=500,
-            margin=dict(l=20, r=20, t=40, b=20),
-            showlegend=False
-        )
-        return fig
         
     except Exception as e:
         print(f"DEBUG: Error generando gráfica: {e}")
         return None
 
-# Crear gráfico de velas japonesas para 5 días antes y 5 días después de la fecha seleccionada, destacando el día seleccionado
-# También eliminamos los sábados y domingos (días no hábiles)
-def plot_candlestick_chart(data, selected_date):
-    # Asegurar que ambos sean naive (sin zona horaria)
-    selected_ts = pd.Timestamp(selected_date).tz_localize(None)
-    data_naive = data.copy()
-    if data_naive.index.tz is not None:
-        data_naive.index = data_naive.index.tz_localize(None)
-
-    # Definir el rango de 5 días antes y 5 días después
-    start_range = selected_ts - timedelta(days=5)
-    end_range = selected_ts + timedelta(days=5)
-
-    # Filtrar los datos para el rango
-    range_data = data_naive.loc[start_range:end_range]
-    range_data = range_data[range_data.index.weekday < 5]
-
-    # Convertir las fechas a categorías para eliminar huecos
-    range_data['Date'] = range_data.index.astype(str)
-
-    # Crear gráfico de velas japonesas con fechas categóricas
-    fig = go.Figure(data=[go.Candlestick(x=range_data['Date'],
-                                         open=range_data['Open'],
-                                         high=range_data['High'],
-                                         low=range_data['Low'],
-                                         close=range_data['Close'],
-                                         increasing_line_color='green',
-                                         decreasing_line_color='red')])
-
-    # Resaltar la vela del día seleccionado
-    if selected_ts in range_data.index:
-        selected_day = range_data.loc[selected_ts]
-        fig.add_trace(go.Candlestick(x=[selected_day['Date']],
-                                     open=[selected_day['Open']],
-                                     high=[selected_day['High']],
-                                     low=[selected_day['Low']],
-                                     close=[selected_day['Close']],
-                                     increasing_line_color='yellow',
-                                     decreasing_line_color='yellow',
-                                     line_width=2))
-
-    fig.update_layout(title='Velas Japonesas - 5 Días Antes y Después (Destacando Día Seleccionado)',
-                      xaxis_title='Fecha',
-                      yaxis_title='Precio',
-                      xaxis_rangeslider_visible=False)
-
-    return fig
-
-# Generar DataFrame con los resultados, predicción, valor real y si la predicción fue correcta o errónea
-def generate_results(model, data):
-    # Detectar qué columnas espera el modelo realmente
-    if model is None:
-        return pd.DataFrame()
-        
-    features = GLOBAL_FEATURES
-    try:
-        if hasattr(model, 'feature_names_in_'):
-            features = list(model.feature_names_in_)
-        elif hasattr(model, 'estimators_') and hasattr(model.estimators_[0], 'feature_names_in_'):
-             features = list(model.estimators_[0].feature_names_in_)
-    except:
-        pass
-    
-    # Trabajar sobre una copia limpia
-    df = data.copy()
-    
-    # Asegurar que todas las features requeridas existan en el DF (rellenar con 0 si faltan)
-    for f in features:
-        if f not in df.columns:
-            df[f] = 0.0
-            
-    # Limpieza final
-    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=['Target'])
-    
-    if df.empty:
-        return pd.DataFrame()
-
-    # Realizar predicciones con las columnas exactas
-    df['Prediction'] = model.predict(df[features])
-    df['Real'] = df['Target']
-    df['Correcto'] = np.where(df['Prediction'] == df['Real'], 'Correcto', 'Erroneo')
-    
-    results = df[['Open', 'Close', 'Prediction', 'Real', 'Correcto']]
-    return results
-
-# Opción de descarga de CSV con delimitador ';'
-def download_csv(dataframe, ticker):
-    csv = dataframe.to_csv(index=True, sep=';')  # Usar ';' como delimitador
-    st.download_button(label="Descargar CSV con Predicciones",
-                       data=csv,
-                       file_name=f'{ticker}_predicciones.csv',
-                       mime='text/csv')
-
-# Guardar el modelo entrenado con el nombre del ticker
-def save_model(model, ticker):
-    # Limpiar el ticker para el nombre del archivo
-    clean_ticker = ticker.replace('^', '').replace('-', '_')
-    filename = f'model_{clean_ticker}.joblib'
-    joblib.dump(model, filename)
-    st.success(f"Modelo guardado como {filename}")
-
-# Cargar un modelo existente basado en el ticker
-def load_model(ticker):
-    clean_ticker = ticker.replace('^', '').replace('-', '_')
-    filename = f'model_{clean_ticker}.joblib'
-    
-    # Compatibilidad con el nombre de archivo anterior para el S&P 500
-    if ticker == '^GSPC' and not os.path.exists(filename) and os.path.exists('sp500_model.joblib'):
-        return joblib.load('sp500_model.joblib')
-        
-    if os.path.exists(filename):
-        return joblib.load(filename)
-    return None
 
 # Función principal de la app Streamlit
 def main():
+    # --- FIX: Event Loop is closed (Streamlit + yfinance) ---
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop is closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     st.set_page_config(
-        page_title="Market Predictor | AI Control Tower",
-        page_icon="📊",
+        page_title="StratEdge Portfolio | Multi-Horizon Strategy Suite",
+        page_icon="⚖️",
         layout="wide",
-        initial_sidebar_state="expanded"
+        initial_sidebar_state="collapsed"
     )
-    st.title('Predicción del Mercado de Valores')
+    # --- CONFIGURACIÓN DE APIS ---
+    groq_api_key = os.getenv('GROQ_API_KEY')
 
-    # Información inicial
-    st.info("📊 Esta aplicación utiliza Machine Learning para predecir movimientos del mercado de valores")
-
-    st.sidebar.header('Parámetros')
-    
-    # Reloj de NY y Estado del Mercado
-    status_text, status_code = check_market_status()
+    # --- HEADER & ESTATUS (RESTORED) ---
     ny_now = get_ny_time()
-    st.sidebar.markdown(f"**🕒 NY Time:** {ny_now.strftime('%H:%M:%S')}")
-    st.sidebar.markdown(f"**Estado:** {status_text}")
-    st.sidebar.markdown("---")
+    status_text, status_code = check_market_status()
+    status_color = "#28a745" if status_code == "open" else "#ffc107" if status_code == "pre" else "#dc3545"
+    
+    col_h1, col_h2 = st.columns([3, 1])
+    with col_h1:
+        st.title("StratEdge Portfolio")
+    with col_h2:
+        st.markdown(f"""
+            <div style='text-align: right; padding: 10px; border-radius: 10px; background: rgba(0,0,0,0.3); border-right: 5px solid {status_color};'>
+                <span style='color: #888; font-size: 0.8em;'>🕒 NY: {ny_now.strftime('%H:%M:%S')}</span><br>
+                <strong style='color: {status_color};'>{status_text}</strong>
+            </div>
+        """, unsafe_allow_html=True)
 
-    selected_stock = st.sidebar.selectbox('Selecciona una acción o índice:', list(TOP_20_STOCKS.keys()))
-
-    # Fuente de Datos: Yahoo Finance (Única opción)
-    # Alpha Vantage removed.
-
-
-    # Usar un rango de 5 años por defecto
+    # --- VALORES DERIVADOS ---
+    selected_stock = 'Apple (AAPL)'
     end_date = dt.now().date()
-    default_start = end_date - timedelta(days=1825)  # 5 años
-    start_date = st.sidebar.date_input('Fecha de inicio', value=default_start, max_value=end_date)
+    default_start = end_date - timedelta(days=1825)
+    start_date = default_start
+    ticker = TOP_20_STOCKS.get(selected_stock, 'AAPL')
 
     # Validar rango de fecha de inicio (Limitar a 30 años para estabilidad)
     max_days_back = 10950 # ~30 años
     if (end_date - start_date).days > max_days_back:
-        st.sidebar.warning(f"⚠️ El rango máximo es de {max_days_back // 365} años para optimizar el rendimiento.")
         start_date = end_date - timedelta(days=max_days_back)
 
-    ticker = TOP_20_STOCKS[selected_stock]
-
-    st.sidebar.info(f"📈 Ticker seleccionado: **{ticker}**")
-    st.sidebar.info(f"📅 Rango: {start_date} a {end_date}")
-    st.sidebar.info(f"📊 Días: {(end_date - start_date).days}")
-    st.sidebar.info(f"🔗 Fuente: **Yahoo Finance**")
 
     # Resetear métricas si cambia el ticker
     if 'last_ticker' not in st.session_state or st.session_state['last_ticker'] != ticker:
@@ -2212,22 +2526,188 @@ def main():
         if 'metrics' in st.session_state:
             del st.session_state['metrics']
             
-    # --- INTEGRACIÓN LLM (Copiloto) ---
-    # --- INTEGRACIÓN LLM (Copiloto) ---
-    st.sidebar.markdown("---")
-    
-    # Cargar API Key de Groq silenciosamente
-    groq_api_key = os.getenv('GROQ_API_KEY')
-    
-    if groq_api_key:
-        st.sidebar.success("✅ Copiloto IA (Groq): Activo")
-    else:
-        st.sidebar.warning("⚠️ Copiloto IA: Inactivo")
-        st.sidebar.info("Para activar la IA, añade GROQ_API_KEY en el archivo .env")
+    # --- ESTILOS PARA CHATBOT FLOTANTE PREMIUM ---
+    st.markdown("""
+        <style>
+        /* Modern Scrollbar */
+        #alpha_chat_box ::-webkit-scrollbar {
+            width: 6px;
+        }
+        #alpha_chat_box ::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.1);
+        }
+        #alpha_chat_box ::-webkit-scrollbar-thumb {
+            background: rgba(40,167,69,0.3);
+            border-radius: 10px;
+        }
+        #alpha_chat_box ::-webkit-scrollbar-thumb:hover {
+            background: rgba(40,167,69,0.5);
+        }
 
-    # Cargar datos con mejor manejo de errores
-    with st.spinner(f'Cargando datos de {selected_stock} desde Yahoo Finance...'):
-        data = load_data(ticker, start_date, end_date)
+        /* Botón Flotante con Pulso */
+        div.stButton > button[key="chat_bubble"] {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            width: 80px;
+            height: 80px;
+            border-radius: 50% !important;
+            background: linear-gradient(135deg, #28a745 0%, #1e7e34 100%) !important;
+            border: 1px solid rgba(255,255,255,0.15) !important;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 0px rgba(40,167,69,0.4);
+            z-index: 1000000;
+            display: flex !important;
+            align-items: center;
+            justify-content: center;
+            font-size: 40px;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            padding: 0 !important;
+            animation: pulse-green 3s infinite;
+        }
+
+        @keyframes pulse-green {
+            0% { box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 0px rgba(40,167,69,0.7); }
+            70% { box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 15px rgba(40,167,69,0); }
+            100% { box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 0px rgba(40,167,69,0); }
+        }
+
+        div.stButton > button[key="chat_bubble"]:hover {
+            transform: scale(1.1) rotate(5deg) translateY(-5px);
+            background: linear-gradient(135deg, #1e7e34 0%, #28a745 100%) !important;
+        }
+        
+        /* Contenedor del Chat (Glassmorphism Avanzado) */
+        div[data-testid="stVerticalBlock"] > div:has(#alpha_chat_anchor) {
+            position: fixed;
+            bottom: 120px;
+            right: 30px;
+            width: 420px;
+            max-height: 700px;
+            background: rgba(13, 17, 23, 0.9);
+            backdrop-filter: blur(20px) saturate(180%);
+            -webkit-backdrop-filter: blur(20px) saturate(180%);
+            border: 1px solid rgba(40,167,69,0.3);
+            border-radius: 28px;
+            z-index: 1000001;
+            padding: 0px;
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.8);
+            animation: slideInChat 0.3s ease-out;
+            overflow: hidden;
+        }
+
+        #alpha_chat_content {
+            padding: 20px;
+        }
+
+        @keyframes slideInChat {
+            from { opacity: 0; transform: translateY(30px) scale(0.95); }
+            to { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        /* Título y Header */
+        .chat-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+        }
+
+        /* Estilo de Mensajes AlphaPilot */
+        #alpha_chat_box [data-testid="stChatMessage"] {
+            background: rgba(255,255,255,0.02) !important;
+            border-radius: 16px !important;
+            border: 1px solid rgba(255,255,255,0.04) !important;
+            margin-bottom: 10px !important;
+            padding: 10px !important;
+        }
+
+        #alpha_chat_box [data-testid="stChatMessageContent"] p {
+            font-size: 0.95rem !important;
+            line-height: 1.5 !important;
+        }
+
+        /* Input del Chat */
+        #alpha_chat_box .stChatInput {
+            border-radius: 12px !important;
+            border: 1px solid rgba(40,167,69,0.2) !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # --- LÓGICA DEL CHATBOT FLOTANTE ---
+    if "chat_open" not in st.session_state:
+        st.session_state["chat_open"] = False
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []
+    if "active_tab" not in st.session_state:
+        st.session_state["active_tab"] = "🔬 Asset Scanner"
+
+    # Botón Toggle
+    bubble_icon = "✖️" if st.session_state["chat_open"] else "🤖"
+    if st.button(bubble_icon, key="chat_bubble"):
+        st.session_state["chat_open"] = not st.session_state["chat_open"]
+        st.rerun()
+
+    # Ventana de Chat
+    if st.session_state["chat_open"]:
+        with st.container():
+            st.markdown('<div id="alpha_chat_anchor"></div>', unsafe_allow_html=True)
+            st.markdown('<div id="alpha_chat_content">', unsafe_allow_html=True)
+            
+            # Header Personalizado
+            h_col1, h_col2, h_col3 = st.columns([5, 1, 1])
+            with h_col1:
+                st.markdown("""
+                    <div style='display: flex; align-items: center; gap: 10px;'>
+                        <span style='font-size: 24px;'>🦾</span>
+                        <div style='line-height: 1;'>
+                            <strong style='font-size: 1.1em; color: #28a745;'>AlphaPilot</strong><br>
+                            <small style='color: #888;'>Estratega de Mercado AI</small>
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+            with h_col2:
+                if st.button("🗑️", help="Limpiar Historial", key="clear_chat_btn"):
+                    st.session_state["chat_history"] = []
+                    st.rerun()
+            with h_col3:
+                if st.button("✖️", help="Cerrar Chat", key="close_chat_btn"):
+                    st.session_state["chat_open"] = False
+                    st.rerun()
+
+            st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+            
+            # Área de Mensajes
+            inner_chat = st.container(height=380)
+            
+            with inner_chat:
+                if not st.session_state["chat_history"]:
+                    st.info("👋 ¡Hola! Soy AlphaPilot. Analizo el mercado en tiempo real para ayudarte a encontrar las mejores oportunidades. ¿En qué puedo apoyarte hoy?")
+                
+                for msg in st.session_state["chat_history"]:
+                    with st.chat_message(msg["role"]):
+                        st.markdown(msg["content"])
+
+            # Input y Lógica
+            api_key = os.getenv('GROQ_API_KEY')
+            if prompt := st.chat_input("¿Qué analizamos ahora?"):
+                st.session_state["chat_history"].append({"role": "user", "content": prompt})
+                with inner_chat:
+                    with st.chat_message("user"):
+                        st.markdown(prompt)
+
+                    with st.chat_message("assistant"):
+                        with st.spinner("AlphaPilot está procesando..."):
+                            response = get_alpha_pilot_response(api_key, prompt, st.session_state["chat_history"])
+                            st.markdown(response)
+                            st.session_state["chat_history"].append({"role": "assistant", "content": response})
+                st.rerun()
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # --- CARGA DE DATOS ---
+    data = load_data(ticker, start_date, end_date)
 
     if data is None or data.empty:
         st.error("❌ No se pudieron cargar los datos.")
@@ -2248,14 +2728,21 @@ def main():
     last_open = data['Open'].iloc[-1]
     previous_close = data['Close'].iloc[-2]
 
-
-    # --- CARGA DE INTELIGENCIA ---
-    model = load_model(ticker)
-
-    # --- ESTRUCTURA DE PANTALLA: TORRE DE CONTROL ---
-    tab_market, tab_stats, tab_brain, tab_scanner, tab_deepdive, tab_calendar, tab_history = st.tabs([
-        "📟 Market Desk", "📊 Estadísticas", "🧠 Inteligencia IA", "🔬 Scanner", "🔍 Deep Dive", "📅 Agenda Económica", "📜 Historial"
-    ])
+    # --- ESTRUCTURA DE PANTALLA PERSISTENTE: STRATEDGE HUB ---
+    tab_list = ["🔬 Asset Scanner", "🎡 The Wheel", "🔍 Strategic Analysis", "📅 Economic Outlook", "📜 History"]
+    
+    active_selection = st.segmented_control(
+        "Navegación Principal",
+        tab_list,
+        default=st.session_state.get("active_tab", tab_list[0]),
+        label_visibility="collapsed",
+        key="main_nav_control"
+    )
+    
+    if active_selection:
+        st.session_state["active_tab"] = active_selection
+    
+    active_tab = st.session_state.get("active_tab", tab_list[0])
 
     # --- NOTIFICACIONES GLOBALES (Instantáneas tras Guardar) ---
     if 'save_success' in st.session_state:
@@ -2265,178 +2752,59 @@ def main():
     if 'save_error' in st.session_state:
         st.error(st.session_state.pop('save_error'))
 
-    with tab_market:
-        # Reloj y Estado (Header Prominente)
-        status_text, status_code = check_market_status()
-        status_color = "#28a745" if status_code == 'open' else "#ffc107" if status_code == 'pre' else "#dc3545"
-        
-        st.markdown(f"""
-        <div style="padding:20px; border-radius:15px; background: rgba(0,0,0,0.3); border-left: 10px solid {status_color}; margin-bottom: 20px;">
-            <h1 style="margin:0; font-size: 1.5em;">{ticker} | Torre de Control</h1>
-            <p style="margin:0; color:{status_color}; font-weight: bold; font-size: 1.1em;">{status_text}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Fila 1: Estado del Mercado
-        m_col1, m_col2, m_col3 = st.columns(3)
-        
-        last_close = data['Close'].iloc[-1]
-        previous_close = data['Close'].iloc[-2]
-        change_pts = last_close - previous_close
-        change_pct = (change_pts / previous_close) * 100
-        
-        m_col1.metric("Precio Actual", f"${last_close:.2f}", f"{change_pts:+.2f} pts")
-        m_col2.metric("Variación %", f"{change_pct:+.2f}%")
-        m_col3.metric("Volumen", f"{data['Volume'].iloc[-1]:,.0f}")
-
-        # --- INDICADOR DE RIESGO DE CRASH ---
-        risk_lvl, risk_color, risk_icon, risk_reasons = calculate_crash_risk(data)
-        st.markdown(f"""
-        <div style="padding:15px; border-radius:10px; background: rgba(0,0,0,0.2); border: 2px solid {risk_color}; margin: 20px 0;">
-            <div style="display:flex; align-items:center; gap:15px;">
-                <span style="font-size:2em;">{risk_icon}</span>
-                <div>
-                    <h4 style="margin:0; color:{risk_color};">RIESGO SISTÉMICO: {risk_lvl}</h4>
-                    <p style="margin:5px 0 0 0; font-size:0.9em; color:#bbb;">Razones: {', '.join(risk_reasons)}</p>
-                </div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Fila 2: Contexto Global (Intermarket)
-        st.markdown("##### 🌍 Contexto Global (Pre-Mercado)")
-        c_col1, c_col2, c_col3, c_col4 = st.columns(4)
-        
-        # VIX
-        if 'VIX_Change' in data.columns:
-            last_vix_ch = data['VIX_Change'].iloc[-1] * 100
-            c_col1.metric("Volatilidad (VIX)", f"{last_vix_ch:+.2f}%")
-        else:
-            c_col1.metric("VIX", "N/D")
-    
-        # Nikkei
-        if 'Nikkei_Return' in data.columns:
-            last_nikkei = data['Nikkei_Return'].iloc[-1] * 100
-            c_col2.metric("Asia (Nikkei)", f"{last_nikkei:+.2f}%")
-        else:
-            c_col2.metric("Asia (Nikkei)", "N/A")
-    
-        # DAX
-        if 'DAX_Return' in data.columns:
-            last_dax = data['DAX_Return'].iloc[-1] * 100
-            c_col3.metric("Europa (DAX)", f"{last_dax:+.2f}%")
-        else:
-            c_col3.metric("Europa (DAX)", "N/A")
-    
-        # Futuros
-        if 'Futures_Return' in data.columns:
-            last_futures = data['Futures_Return'].iloc[-1] * 100
-            c_col4.metric("Futuros (ES=F)", f"{last_futures:+.2f}%")
-        else:
-            c_col4.metric("Futuros", "N/A")
-
-    # --- NUEVO APARTADO: MÉTRICAS DEL ACTIVO ---
-    st.markdown("---")
-    with tab_stats:
-        st.subheader(f"📊 Análisis de Movimientos: {selected_stock}")
-        
-        # Cálculos de métricas históricas
-        col_date1, col_date2 = st.columns(2)
-        m_start = col_date1.date_input("Inicio Análisis", value=data.index[-30].date() if len(data) > 30 else data.index[0].date(), min_value=data.index[0].date(), max_value=data.index[-1].date(), key="m_start")
-        m_end = col_date2.date_input("Fin Análisis", value=data.index[-1].date(), min_value=data.index[0].date(), max_value=data.index[-1].date(), key="m_end")
-        
-        if st.button("📊 Generar Reporte de Movimientos", use_container_width=True):
-            mask = (data.index.date >= m_start) & (data.index.date <= m_end)
-            df_metrics = data.loc[mask].copy()
-            
-            if not df_metrics.empty:
-                # Cálculos (Simplificado para el chunk)
-                df_metrics['Diff_Points'] = df_metrics['Close'].diff()
-                df_metrics['Intraday_Diff'] = df_metrics['Close'] - df_metrics['Open']
-                
-                e_col1, e_col2 = st.columns(2)
-                e_col1.metric("Máxima Subida", f"+{df_metrics['Returns'].max()*100:.2f}%")
-                e_col2.metric("Máxima Caída", f"{df_metrics['Returns'].min()*100:.2f}%")
-                
-                st.markdown("#### Movimiento Intradía Promedio")
-                st.info(f"El activo se mueve en promedio **{df_metrics['Intraday_Diff'].abs().mean():.2f} puntos** entre apertura y cierre.")
-                
-            st.line_chart(data['Close'])
-        
-        st.markdown("---")
-        st.subheader("🧪 Terminal de Backtesting")
-        
-        # Inicializar Racha en session_state
-        if 'backtest_streak' not in st.session_state:
-            st.session_state['backtest_streak'] = 0
-
-        back_col1, back_col2 = st.columns([1, 2])
-        with back_col1:
-            test_date = st.date_input("Fecha de Simulación", value=data.index[-2].date())
-            
-            # Mostrar Racha Actual
-            streak = st.session_state['backtest_streak']
-            if streak > 0:
-                st.markdown(f"🔥 **Racha Actual: {streak} Aciertos**")
-            
-            if st.button("🚀 Ejecutar Simulación"):
-                if model:
-                    p, prob, next_d = predict_from_date(model, data, pd.Timestamp(test_date))
-                    st.write(f"Resultado IA: **{'Subida 🟢' if p==1 else 'Bajada 🔴'}**")
-                    
-                    # Verificar si ya tenemos el resultado real para esa fecha
-                    if next_d in data.index:
-                        real_return = data.loc[next_d, 'Returns']
-                        real_direction = 1 if real_return > 0 else 0
-                        
-                        if p == real_direction:
-                            st.session_state['backtest_streak'] += 1
-                            st.success(f"🎯 **ACERTADO** (El mercado {'subió' if real_direction==1 else 'bajó'} un {real_return*100:.2f}%)")
-                            if st.session_state['backtest_streak'] >= 3:
-                                st.balloons()
-                        else:
-                            st.session_state['backtest_streak'] = 0
-                            st.error(f"❌ **FALLO** (El mercado {'subió' if real_direction==1 else 'bajó'} un {real_return*100:.2f}%)")
-                    else:
-                        st.info("⌛ Resultado real pendiente.")
-                        
-                    market_db.save_prediction(ticker, next_d, p, prob[1], prob[0], 1)
-        with back_col2:
-            st.plotly_chart(plot_candlestick_chart(data, pd.Timestamp(test_date)), use_container_width=True)
-
-    st.markdown("---")
 
 
-    with tab_brain:
-        st.subheader("🧠 Auditoría de IA (Confidence & Metrics)")
+    # --- CALCULADORA DE POSICIÓN GLOBAL (SIDEBAR) ---
+    with st.sidebar.expander("🧮 Calculadora de Gestión de Riesgo", expanded=True):
+        st.markdown("#### Planifica tu Trade")
+        account_size = st.number_input("💰 Capital Total ($)", value=10000, step=1000)
+        risk_pct = st.slider("⚠️ Riesgo por Operación (%)", 0.5, 5.0, 1.0, 0.5)
         
-        if model:
-            if 'metrics' in st.session_state:
-                accuracy, precision, recall, f1 = st.session_state['metrics']
-                m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-                m_col1.metric('Exactitud', f'{accuracy:.2f}')
-                m_col2.metric('Precisión', f'{precision:.2f}')
-                m_col3.metric('Sensibilidad', f'{recall:.2f}')
-                m_col4.metric('F1-score', f'{f1:.2f}')
+        risk_amount = account_size * (risk_pct / 100)
+        st.info(f"Riesgo Máximo: **${risk_amount:.2f}**")
+        
+        # Inicializar valores en session_state si no existen
+        if 'calc_entry' not in st.session_state: st.session_state['calc_entry'] = 0.0
+        if 'calc_stop' not in st.session_state: st.session_state['calc_stop'] = 0.0
+        if 'calc_tp' not in st.session_state: st.session_state['calc_tp'] = 0.0
+
+        # Usar variables locales para los widgets, alimentados por el estado
+        calc_entry = st.number_input("Precio Entrada ($)", value=float(st.session_state['calc_entry']), step=0.1)
+        calc_stop = st.number_input("Stop Loss ($)", value=float(st.session_state['calc_stop']), step=0.1)
+        calc_tp = st.number_input("Take Profit ($)", value=float(st.session_state['calc_tp']), step=0.1)
+        
+        # Actualizar el estado con el valor actual del widget para persistencia
+        st.session_state['calc_entry'] = calc_entry
+        st.session_state['calc_stop'] = calc_stop
+        st.session_state['calc_tp'] = calc_tp
+
+        if calc_entry > 0 and calc_stop > 0 and calc_entry > calc_stop:
+            risk_per_share = calc_entry - calc_stop
+            shares = int(risk_amount // risk_per_share)
+            position_value = shares * calc_entry
             
             st.markdown("---")
-            st.write("📊 **Importancia de Variables (Comité de Modelos)**")
-            importance_fig = plot_feature_importance(model, GLOBAL_FEATURES)
-            if importance_fig:
-                st.plotly_chart(importance_fig, use_container_width=True)
+            st.success(f"🎯 **Comprar: {shares} acciones**")
+            st.caption(f"Valor Posición: ${position_value:,.2f}")
+
+            # Cálculo de R/R si hay Take Profit
+            if calc_tp > calc_entry:
+                profit_per_share = calc_tp - calc_entry
+                total_profit = shares * profit_per_share
+                rr_ratio = profit_per_share / risk_per_share
+                st.info(f"💰 Ganancia Estimada: **${total_profit:.2f}**\n\n⚖️ R/R Ratio: **1:{rr_ratio:.2f}**")
             
-            # Descargar resultados
-            try:
-                results_df = generate_results(model, data)
-                if not results_df.empty:
-                    download_csv(results_df, ticker)
-            except Exception as e:
-                st.error(f"🚨 Error al generar historial: {e}. Se recomienda re-entrenar el modelo.")
-        else:
-            st.info("No hay un modelo activo. Usa el sidebar para entrenar uno nuevo.")
+            if position_value > account_size:
+                st.warning("⚠️ ¡Cuidado! Esta posición usa margin (aplacamiento).")
+        elif calc_entry > 0 and calc_stop >= calc_entry:
+            st.error("El Stop Loss debe ser menor a la Entrada.")
+
+    st.markdown("---")
+
+
 
     # --- MOMENTUM SCANNER TAB ---
-    with tab_scanner:
+    if active_tab == "🔬 Asset Scanner":
         st.subheader("🔬 Momentum Scanner & Rotación de Sectores")
         st.info("💡 Análisis de flujo de capital. Identifica qué sectores lideran el mercado antes de elegir una acción.")
         
@@ -2456,69 +2824,22 @@ def main():
         smooth_check = st.checkbox("🧘 Filtrar por 'Momentum Suave' (Busca subidas constantes, evita saltos violentos)", value=False)
 
         
-        # --- CALCULADORA DE POSICIÓN (SIDEBAR) ---
-        with st.sidebar.expander("🧮 Calculadora de Gestión de Riesgo", expanded=True):
-            st.markdown("#### Planifica tu Trade")
-            account_size = st.number_input("💰 Capital Total ($)", value=10000, step=1000)
-            risk_pct = st.slider("⚠️ Riesgo por Operación (%)", 0.5, 5.0, 1.0, 0.5)
-            
-            risk_amount = account_size * (risk_pct / 100)
-            st.info(f"Riesgo Máximo: **${risk_amount:.2f}**")
-            
-            # Inicializar valores en session_state si no existen
-            if 'calc_entry' not in st.session_state: st.session_state['calc_entry'] = 0.0
-            if 'calc_stop' not in st.session_state: st.session_state['calc_stop'] = 0.0
-            if 'calc_tp' not in st.session_state: st.session_state['calc_tp'] = 0.0
-
-            # Usar variables locales para los widgets, alimentados por el estado
-            calc_entry = st.number_input("Precio Entrada ($)", value=float(st.session_state['calc_entry']), step=0.1)
-            calc_stop = st.number_input("Stop Loss ($)", value=float(st.session_state['calc_stop']), step=0.1)
-            calc_tp = st.number_input("Take Profit ($)", value=float(st.session_state['calc_tp']), step=0.1)
-            
-            # Actualizar el estado con el valor actual del widget para persistencia
-            st.session_state['calc_entry'] = calc_entry
-            st.session_state['calc_stop'] = calc_stop
-            st.session_state['calc_tp'] = calc_tp
-
-            
-            if calc_entry > 0 and calc_stop > 0 and calc_entry > calc_stop:
-                risk_per_share = calc_entry - calc_stop
-                shares = int(risk_amount // risk_per_share)
-                position_value = shares * calc_entry
-                
-                st.markdown("---")
-                st.success(f"🎯 **Comprar: {shares} acciones**")
-                st.caption(f"Valor Posición: ${position_value:,.2f}")
-
-                # Cálculo de R/R si hay Take Profit
-                if calc_tp > calc_entry:
-                    profit_per_share = calc_tp - calc_entry
-                    total_profit = shares * profit_per_share
-                    rr_ratio = profit_per_share / risk_per_share
-                    st.info(f"💰 Ganancia Estimada: **${total_profit:.2f}**\n\n⚖️ R/R Ratio: **1:{rr_ratio:.2f}**")
-
-
-                
-                if position_value > account_size:
-
-                    st.warning("⚠️ ¡Cuidado! Esta posición usa margin (aplacamiento).")
-            elif calc_entry > 0 and calc_stop >= calc_entry:
-                st.error("El Stop Loss debe ser menor a la Entrada.")
         
-        if st.button("🚀 Iniciar Escaneo de Mercado", use_container_width=True, type="primary"):
+        if st.button("🚀 Iniciar Escaneo de Mercado", type="primary"):
             scan_df = scan_momentum_stocks(price_range[0], price_range[1], min_vol, smooth_check)
 
             if not scan_df.empty:
                 # Enriquecer con Sectores para el Heatmap (solo para los resultados)
-                with st.spinner('Mapeando sectores...'):
-                    sectors = []
-                    for t in scan_df['Ticker']:
+                with st.spinner('Mapeando sectores en paralelo...'):
+                    def get_ticker_sector(t):
                         try:
                             # Cachear el sector para no saturar API
-                            s_info = yf.Ticker(t).info.get('sector', 'Otros')
-                            sectors.append(s_info)
+                            return yf.Ticker(t).info.get('sector', 'Otros')
                         except:
-                            sectors.append('N/D')
+                            return 'N/D'
+                    
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        sectors = list(executor.map(get_ticker_sector, scan_df['Ticker']))
                     scan_df['Sector'] = sectors
                 
                 scan_df = scan_df[scan_df['Score'] >= min_score].reset_index(drop=True)
@@ -2623,8 +2944,15 @@ def main():
                 except: pass
                 return ''
             
+            def color_weinstein(val):
+                if "2" in str(val): return 'color: #28a745; font-weight: bold'
+                elif "4" in str(val): return 'color: #dc3545; font-weight: bold'
+                elif "1" in str(val) or "3" in str(val): return 'color: #ffc107'
+                return ''
+            
             styled = scan_df.style.map(color_score, subset=['Score'])
             styled = styled.map(color_change, subset=['1D%', '5D%', '20D%'])
+            styled = styled.map(color_weinstein, subset=['Etapa W'])
             st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
             
             # Selección de acción para análisis profundo
@@ -2724,7 +3052,10 @@ def main():
                     
                     if 'Error' not in fundies:
                         st.markdown(f"**{fundies.get('Short Name', selected_ticker)}**")
-                        st.markdown(f"🏢 {fundies.get('Sector', 'N/D')} | {fundies.get('Industry', 'N/D')}")
+                        
+                        # Extraer etapa de Weinstein de los resultados del scanner
+                        w_stage_scan = scan_df[scan_df['Ticker'] == selected_ticker]['Etapa W'].iloc[0] if 'Etapa W' in scan_df.columns else "N/D"
+                        st.markdown(f"🏢 {fundies.get('Sector', 'N/D')} | {fundies.get('Industry', 'N/D')} | **Weinstein: {w_stage_scan}**")
                         
                         # Market Cap
                         mcap = fundies.get('Market Cap', 0)
@@ -2802,7 +3133,7 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
                         
-                        st.markdown(analysis.replace("$", "\$"))
+                        st.markdown(analysis.replace("$", "\\$"))
                         
                         # --- EXTRACCIÓN DE SL/TP PARA AUTOMATIZACIÓN ---
                         ai_sl = 0.0
@@ -2839,11 +3170,13 @@ def main():
                 else:
                     st.warning("Configura GROQ_API_KEY en .env para habilitar el análisis IA.")
 
-    with tab_calendar:
+    if active_tab == "📅 Economic Outlook":
         st.subheader("📅 Calendario Económico Semanal (EE.UU.)")
         st.info("💡 Resaltado en verde los eventos de HOY. Los datos pasados ayudan a entender el contexto de la semana.")
         
         cal_df = get_economic_calendar()
+        if not cal_df.empty:
+            cal_df = cal_df.reset_index(drop=True)
         
         if "Error" in cal_df.columns:
             st.error(cal_df["Error"].iloc[0])
@@ -2864,8 +3197,165 @@ def main():
                 summary_cal.append(f"- {row.get('Fecha', '')} {row.get('Hora', '')} | {row.get('Evento', 'N/D')} | Act: {row.get('Actual', '-')} Prev: {row.get('Previsto', '-')}")
             st.session_state['calendar_text'] = "\n".join(summary_cal)
 
+    # --- WHEEL STRATEGY TAB ---
+    if active_tab == "🎡 The Wheel":
+        st.markdown("""
+        <div style="padding:20px; border-radius:15px; background: linear-gradient(135deg, rgba(20,40,40,0.8), rgba(10,60,30,0.6)); border-left: 8px solid #28a745; margin-bottom: 25px;">
+            <h2 style="margin:0; color:#e0e0e0;">🎡 The Wheel: Generador de Rentas</h2>
+            <p style="margin:5px 0 0 0; color:#bbb; font-size:0.95em;">Estrategia Cash Secured Puts. Identifica acciones de alta calidad para cobrar primas mensuales con seguridad.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        w_col1, w_col2, w_col3 = st.columns([2, 2, 1])
+        with w_col1:
+            wheel_budget = st.number_input("💰 Mi Capital Total ($)", value=10000, step=1000, help="Filtra activos que puedas cubrir con este capital.")
+        with w_col2:
+            wheel_max_p = st.number_input("💵 Precio Máximo Acción ($)", value=500, step=10, help="Límite máximo de precio por acción.")
+        with w_col3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            run_wheel = st.button("🚀 Escanear ~250 Activos", use_container_width=True, type='primary', help="Inicia escaneo multihilo (3 min aprox)")
+            
+        if run_wheel:
+            with st.spinner("🔬 Escaneando el universo de 250 acciones en paralelo..."):
+                # Escaneamos todo el universo (budget alto y sin filtro precio) para llenar el cache
+                wheel_df = get_wheel_recommendations(999999, 500) 
+                if not wheel_df.empty:
+                    market_db.save_wheel_results(wheel_df)
+                    st.success("✅ Escaneo completado y guardado en base de datos.")
+                else:
+                    st.warning("No se encontraron nuevas oportunidades en este momento.")
+
+        # Cargar resultados (del escaneo actual o del caché)
+        df_w_raw = market_db.get_wheel_cache()
+        
+        if not df_w_raw.empty:
+            # Filtrar el caché por los parámetros actuales del usuario (capital y precio)
+            df_w = df_w_raw[
+                (df_w_raw['Capital Requerido'] <= wheel_budget) & 
+                (df_w_raw['Precio'] <= wheel_max_p)
+            ].copy().reset_index(drop=True)
+
+            # Obtener fecha del raw ya que df_w podría estar vacío por los filtros
+            last_upd = df_w_raw['Última Actualización'].iloc[0] if not df_w_raw.empty and 'Última Actualización' in df_w_raw.columns else "Desconocida"
+            st.caption(f"📅 Último escaneo global: {last_upd} | {len(df_w)} activos cumplen tus filtros actuales.")
+            
+            if not df_w.empty:
+                # Formateo de tabla
+                def style_wheel(df):
+                    return df.style.format({
+                        'Precio': '${:.2f}',
+                        'Strike': '${:.2f}',
+                        'Capital Requerido': '${:,.2f}',
+                        'Prima': '${:.2f}'
+                    }).map(lambda x: 'color: #28a745; font-weight: bold', subset=['Anualizado'])
+
+                st.dataframe(style_wheel(df_w), use_container_width=True, hide_index=True)
+                
+                # --- LÓGICA DE SELECCIÓN AUTOMÁTICA (PROPUESTA) ---
+                div_candidates = df_w.sort_values('annualized', ascending=False).drop_duplicates('Sector')
+                auto_selected = []
+                temp_cap = 0
+                proposed_rows = []
+                for _, row in div_candidates.iterrows():
+                    if temp_cap + row['Capital Requerido'] <= wheel_budget:
+                        auto_selected.append(row['Ticker'])
+                        proposed_rows.append(row)
+                        temp_cap += row['Capital Requerido']
+                
+                # --- SECCIÓN: PROPUESTA INICIAL (VISUAL) ---
+                st.markdown("---")
+                st.subheader("🏗️ Propuesta de Portafolio Diversificado")
+                st.caption(f"Selección recomendada para optimizar tus ${wheel_budget:,.0f} evitando concentración sectorial.")
+                
+                if proposed_rows:
+                    p_cols = st.columns(len(proposed_rows))
+                    for col, row in zip(p_cols, proposed_rows):
+                        with col:
+                            st.markdown(f"""
+                            <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:10px; border-left: 4px solid #28a745; min-height: 120px;">
+                                <h4 style="margin:0; font-size:0.95em;">{row['Ticker']}</h4>
+                                <p style="font-size:0.65em; color:#aaa; margin-bottom:5px;">{row['Sector']}</p>
+                                <p style="margin:2px 0; font-size:0.8em;">Strike: <b>${row['Strike']}</b></p>
+                                <p style="margin:5px 0 0 0; color:#28a745; font-weight:bold; font-size:0.85em;">{row['Anualizado']}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    if st.button("🔄 Restablecer a Selección Propuesta", use_container_width=True):
+                        st.session_state['wheel_multi_selection_v2'] = auto_selected
+                        st.session_state['wheel_ai_report'] = None
+                        st.rerun()
+                
+                # --- INTERACTOR DE PORTAFOLIO ---
+                st.markdown("### 🛠️ Personalizar Selección")
+                
+                # Inicializar el widget si no existe
+                if 'wheel_multi_selection_v2' not in st.session_state:
+                    st.session_state['wheel_multi_selection_v2'] = auto_selected
+
+                # Validación de tickers existentes en el widget state
+                current_sel = st.session_state['wheel_multi_selection_v2']
+                valid_options = df_w['Ticker'].tolist()
+                st.session_state['wheel_multi_selection_v2'] = [t for t in current_sel if t in valid_options]
+
+                selected_tickers = st.multiselect(
+                    "Agrega o quita acciones de tu lista:",
+                    options=valid_options,
+                    key="wheel_multi_selection_v2"
+                )
+                
+                # Filtrar DF por selección
+                portfolio_df = df_w[df_w['Ticker'].isin(selected_tickers)].copy().reset_index(drop=True)
+                total_used = portfolio_df['Capital Requerido'].sum()
+                remaining = wheel_budget - total_used
+                
+                # Métricas de Portafolio
+                st.markdown("<br>", unsafe_allow_html=True)
+                m_col1, m_col2, m_col3 = st.columns(3)
+                m_col1.metric("Capital Utilizado", f"${total_used:,.0f}", delta=f"{ (total_used/wheel_budget)*100:.1f}%", delta_color="normal")
+                m_col2.metric("Disponible", f"${remaining:,.0f}", delta=f"${wheel_budget:,.0f} Total", delta_color="off")
+                m_col3.metric("Prima Mensual Est.", f"${portfolio_df['Prima'].sum()*100:,.2f}")
+                
+                # Visualización Detallada del Portafolio Actual
+                if not portfolio_df.empty:
+                    st.write("📋 **Tu Selección Actual:**")
+                    st.dataframe(portfolio_df[['Ticker', 'Sector', 'Strike', 'Prima', 'Anualizado', 'Capital Requerido']], use_container_width=True, hide_index=True)
+                    
+                    if remaining < 0:
+                        st.error(f"⚠️ ¡Has superado tu capital por ${abs(remaining):,.0f}! Revisa tu selección.")
+                    
+                    st.markdown("---")
+                    
+                    # Persistencia del Análisis IA
+                    if 'wheel_ai_report' not in st.session_state:
+                        st.session_state['wheel_ai_report'] = None
+
+                    ai_col1, ai_col2 = st.columns([4, 1])
+                    with ai_col1:
+                        if st.button("🧠 Análisis de Salud del Portafolio (IA)", use_container_width=True, type='primary'):
+                            if groq_api_key:
+                                with st.spinner("Analizando robustez del portafolio..."):
+                                    report = ai_wheel_portfolio_analysis(groq_api_key, portfolio_df, wheel_budget)
+                                    st.session_state['wheel_ai_report'] = report
+                            else:
+                                st.warning("Configura la API Key para este análisis.")
+                    
+                    with ai_col2:
+                        if st.session_state['wheel_ai_report'] and st.button("🗑️ Limpiar", use_container_width=True):
+                            st.session_state['wheel_ai_report'] = None
+                            st.rerun()
+
+                    if st.session_state['wheel_ai_report']:
+                        st.markdown(st.session_state['wheel_ai_report'])
+                else:
+                    st.info("La lista está vacía. Selecciona activos arriba para empezar.")
+            else:
+                st.warning("Ninguno de los activos en el historial cumple con tu capital o precio máximo. Inicia un nuevo escaneo.")
+        else:
+            st.info("👋 Bienvenida/o al Escáner de la Rueda. Haz clic en **Escaneas ~250 Activos** para construir tu primera base de datos de oportunidades.")
+
+
     # --- DEEP DIVE TAB ---
-    with tab_deepdive:
+    if active_tab == "🔍 Strategic Analysis":
         st.markdown("""
         <div style="padding:20px; border-radius:15px; background: linear-gradient(135deg, rgba(30,30,60,0.8), rgba(60,20,80,0.6)); border-left: 8px solid #a855f7; margin-bottom: 25px;">
             <h2 style="margin:0; color:#e0e0e0;">🔍 Stock Deep Dive</h2>
@@ -2923,11 +3413,15 @@ def main():
             g = dd_fin['general']
             
             # --- HEADER: PERFIL DE LA EMPRESA ---
+            w_stage = dd_tech.get('weinstein', 'N/D') if dd_tech else 'N/D'
+            w_color = "#28a745" if "2" in str(w_stage) else "#dc3545" if "4" in str(w_stage) else "#ffc107"
+            w_badge = f'<span style="background:{w_color}; color:white; padding: 4px 10px; border-radius: 20px; font-size: 0.6em; margin-left: 10px; vertical-align: middle;">Etapa Weinstein: {w_stage}</span>' if w_stage != 'N/D' else ''
+
             st.markdown(f"""
             <div style="padding:20px; border-radius:12px; background: rgba(0,0,0,0.3); margin-bottom:15px;">
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
                     <div>
-                        <h2 style="margin:0; color:white;">{g['shortName']} ({dd_ticker})</h2>
+                        <h2 style="margin:0; color:white;">{g['shortName']} ({dd_ticker}) {w_badge}</h2>
                         <p style="margin:3px 0; color:#aaa;">{g['sector']} | {g['industry']} | {g['country']}</p>
                     </div>
                     <div style="text-align:right;">
@@ -3153,6 +3647,20 @@ def main():
             if dd_tech:
                 st.markdown("### 📉 Análisis Técnico Avanzado")
                 
+                # --- NUEVA SECCIÓN: ETAPA DE WEINSTEIN ---
+                w_stage = dd_tech.get('weinstein', 'N/D')
+                if w_stage != 'N/D':
+                    w_color = "#28a745" if "2" in w_stage else "#dc3545" if "4" in w_stage else "#ffc107"
+                    st.markdown(f"""
+                    <div style="background: rgba(0,0,0,0.2); border: 1px solid {w_color}; padding: 12px; border-radius: 10px; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
+                        <span style="font-size: 1.5em;">📊</span>
+                        <div>
+                            <p style="margin:0; font-size: 0.8em; color: #aaa;">Etapa de Weinstein (Ciclo de Largo Plazo):</p>
+                            <p style="margin:0; font-size: 1.1em; font-weight: bold; color: {w_color};">{w_stage}</p>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
                 # Performance Badges
                 perf_cols = st.columns(5)
                 perf_data = [
@@ -3315,7 +3823,22 @@ def main():
             
             # --- FILA 6: DESCRIPCIÓN + DATOS ADICIONALES ---
             with st.expander("📖 Descripción de la Empresa", expanded=False):
-                st.write(g.get('summary', 'Sin descripción disponible.'))
+                summary = g.get('summary', 'Sin descripción disponible.')
+                
+                # Sistema de traducción on-demand
+                summary_key = f"summary_es_{dd_ticker}"
+                if summary_key in st.session_state:
+                    st.info("✅ Traducción al español habilitada")
+                    st.write(st.session_state[summary_key])
+                else:
+                    st.write(summary)
+                    if groq_api_key and summary != 'Sin descripción disponible.':
+                        if st.button("🌐 Traducir al Español (IA)", key=f"btn_trans_{dd_ticker}"):
+                            with st.spinner("Traduciendo..."):
+                                translated = translate_text(groq_api_key, summary)
+                                st.session_state[summary_key] = translated
+                                st.rerun()
+
                 if g.get('website'):
                     st.markdown(f"🌐 [{g['website']}]({g['website']})")
                 if g.get('employees') and g['employees'] > 0:
@@ -3397,328 +3920,115 @@ def main():
             else:
                 st.warning("⚠️ Configura GROQ_API_KEY en .env para habilitar el análisis IA profundo.")
 
-    with tab_market:
-        st.sidebar.markdown("---")
-        if st.sidebar.button('🚆 Entrenar / Sincronizar Modelo'):
-            with st.spinner('Consolidando inteligencia del comité...'):
-                model, X_test, y_test = train_model(data)
-                save_model(model, ticker)
-                st.session_state['metrics'] = evaluate_model(model, X_test, y_test)
-                st.rerun()
 
-        # Operación Maestra
-        st.markdown("### 🚀 Señal de Trading")
-        btn_label = "🎯 OBTENER SESGO DE APERTURA" if status_code == 'pre' else "🔮 CONSULTAR PREDICCIÓN"
-        
-        if st.button(btn_label, use_container_width=True):
-            if model:
-                try:
-                    res = predict_next_day(model, data)
-                    st.session_state['last_pred'] = {
-                        'prediction': res[0],
-                        'proba': res[1],
-                        'date': res[2],
-                        'breadth': res[3],
-                        'note': res[4]
-                    }
-                    market_db.save_prediction(ticker, res[2], res[0], res[1][1], res[1][0], 0)
-                except Exception as e:
-                    st.error(f"🚨 Error de inteligencia: {e}. Por favor, pulsa 'Entrenar' en el sidebar para sincronizar.")
-
-        # Mostrar Predicción Persistente
-        if 'last_pred' in st.session_state:
-            lp = st.session_state['last_pred']
-            st.info(f"📝 {lp['note']}")
-            
-            p_col1, p_col2 = st.columns([2, 1])
-            with p_col1:
-                if lp['prediction'] == 1:
-                    st.success(f"### Predicción: SUBIDA (🟢 {lp['proba'][1]*100:.1f}%)")
-                elif lp['prediction'] == 0:
-                    st.error(f"### Predicción: BAJADA (🔴 {lp['proba'][0]*100:.1f}%)")
-                else:
-                    st.warning("### Predicción: NEUTRAL / ESPERAR")
-            with p_col2:
-                st.write(f"Vence: **{lp['date'].strftime('%d/%m/%Y')}**")
-
-            # Alineación
-            st.markdown("##### 📊 Alineación S&P vs NYSE")
-            sp_ret, nya_ret = lp['breadth']['sp500_ret'], lp['breadth']['nya_ret']
-            color = "green" if (sp_ret * nya_ret > 0) else "red"
-            st.markdown(f"""
-            <div style="padding:10px; border-radius:5px; background: rgba(0,0,0,0.2); border-left: 5px solid {color};">
-                <b>Estado:</b> {"✅ Sincronizado" if color=="green" else "⚠️ Divergente"}<br>
-                S&P: {sp_ret*100:+.2f}% | NYSE: {nya_ret*100:+.2f}%
-            </div>
-            """, unsafe_allow_html=True)
-
-            # --- OPCIONES SENTIMENT (NUEVO) ---
-            opt_data = get_options_sentiment(ticker)
-            if opt_data:
-                st.markdown("##### 🎰 Radar de Opciones (Smart Money)")
-                st.markdown(f"""
-                <div style="padding:15px; border-radius:10px; border: 1px solid {opt_data['color']}; background: rgba(0,0,0,0.2);">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h4 style="margin:0; color:{opt_data['color']};">{opt_data['sent']}</h4>
-                        <span style="font-size:0.8em; color:#fff; background:{opt_data['color']}; padding:2px 8px; border-radius:10px;">P/C: {opt_data['ratio']:.2f}</span>
-                    </div>
-                    <div style="margin-top:10px; padding:10px; background:rgba(255,255,255,0.05); border-radius:5px;">
-                        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
-                            <span style="color:#ff6b6b; font-weight:bold;">🧱 Call Wall (Resistencia):</span>
-                            <span style="color:white;">${opt_data['call_wall']:,.0f}</span>
-                        </div>
-                        <div style="display:flex; justify-content:space-between;">
-                            <span style="color:#51cf66; font-weight:bold;">🛡️ Put Wall (Soporte):</span>
-                            <span style="color:white;">${opt_data['put_wall']:,.0f}</span>
-                        </div>
-                    </div>
-                    <div style="display:flex; justify-content:space-between; font-size:0.75em; margin-top:8px; color:#999;">
-                        <span>Vol. Calls: {int(opt_data['vol_calls']):,}</span>
-                        <span>Vol. Puts: {int(opt_data['vol_puts']):,}</span>
-                        <span>Exp: {opt_data['exp']}</span>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            # --- MONITOR SNIPER LIVE ---
-            st.markdown("---")
-            head_col1, head_col2 = st.columns([2, 1])
-            head_col1.subheader("🎯 Monitor SNIPER")
-            live_tracking = head_col2.toggle("📡 Rastreo en Vivo (60s)", value=False)
-
-            snip = get_intraday_momentum(ticker)
-            
-            # --- COPILOTO ESTRATÉGICO (LLM) ---
-            with st.expander("🤖 Copiloto Estratégico (IA)", expanded=True):
-                # Botones de Acción
-                c_col1, c_col2 = st.columns(2)
-                
-                with c_col1:
-                    btn_tactical = st.button("🧠 INFORME TÁCTICO (Técnico)", use_container_width=True)
-                with c_col2:
-                    btn_briefing = st.button("🌅 BRIEFING PRE-MERCADO (Noticias)", use_container_width=True)
-
-                if 'last_pred' in st.session_state:
-                     # Recopilar contexto común
-                    ctx = {
-                        'prediction': "ALCISTA" if st.session_state['last_pred']['prediction'] == 1 else "BAJISTA",
-                        'confidence': f"{max(st.session_state['last_pred']['proba'])*100:.1f}%",
-                        'risk': risk_lvl,
-                        'sniper_status': snip['status'] if snip else "Esperando datos...",
-                        'sniper_force': int(snip['force']) if snip else 0,
-                        'options_sent': opt_data['sent'] if opt_data else "Sin datos",
-                        'pc_ratio': f"{opt_data['ratio']:.2f}" if opt_data else "N/A",
-                        'call_wall': f"${opt_data['call_wall']:,.0f}" if opt_data else "N/A",
-                        'put_wall': f"${opt_data['put_wall']:,.0f}" if opt_data else "N/A",
-                        'context_note': st.session_state['last_pred']['note']
-                    }
-                    
-                    if btn_tactical:
-                        with st.spinner("Analizando estructura de mercado..."):
-                            analysis = get_llm_analysis(groq_api_key, ctx)
-                            st.info("### 🛡️ Informe Táctico (Intradía)")
-                            st.markdown(analysis.replace("$", "\$"))
-                            
-                    if btn_briefing:
-                        with st.spinner("Leyendo noticias y cruzando datos..."):
-                            news = get_market_news(ticker)
-                            cal_txt = st.session_state.get('calendar_text', "Sin eventos macro reportados.")
-                            briefing = get_pre_market_briefing(groq_api_key, ctx, news, cal_txt)
-                            st.success("### 🌅 Briefing Pre-Mercado (Macro + Técnico)")
-                            st.markdown(briefing.replace("$", "\$"))
-                            st.markdown("---")
-                            st.caption("📰 Titulares Fuente:")
-                            st.text(news)
-                else:
-                    if btn_tactical or btn_briefing:
-                        st.warning("Primero debes obtener una predicción del modelo.")
-
-            if snip:
-                s_col1, s_col2 = st.columns([1, 2])
-                with s_col1:
-                    st.markdown(f"""
-                    <div style="padding:15px; border-radius:10px; background:{snip['color']}; color:white; text-align:center; border: 2px solid white;">
-                        <h1 style="margin:0;">{snip['icon']}</h1>
-                        <p style="margin:5px 0; font-weight:bold;">{snip['status']}</p>
-                        <p style="margin:0; font-size:0.8em;">
-                            <b>Precio (Live):</b> ${snip['price']:.2f}<br>
-                            <b>Cierre Anterior:</b> ${snip['prev_close']:.2f}<br>
-                            <b>Apertura (4am):</b> ${snip['open']:.2f}<br>
-                            <b>VWAP:</b> ${snip['vwap']:.2f}
-                        </p>
-                        <p style="margin:5px 0 0 0; font-size:0.7em; color:#ddd;">Actualizado (NY): {get_ny_time().strftime('%H:%M:%S')}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    st.markdown(f"**Fuerza del Mercado: {snip['force']:.0f}%**")
-                    st.progress(snip['force']/100)
-
-                    # --- VALIDADOR DE BIAS VS TENDENCIA REAL ---
-                    if lp['prediction'] == 1: # IA dice Subida
-                        if snip['score'] == 3:
-                            st.success("✅ **VALIDADO:** Tendencia e IA sincronizadas.")
-                        elif snip['bear_score'] >= 2:
-                            st.error("🚨 **INVALIDADO:** La tendencia real es bajista. ¡Cuidado con la compra!")
-                        else:
-                            st.warning("⏳ **ESPERANDO CONFLUENCIA:** Tendencia mixta.")
-                    
-                    elif lp['prediction'] == 0: # IA dice Bajada
-                        if snip['bear_score'] == 3:
-                            st.success("✅ **VALIDADO:** Tendencia e IA sincronizadas.")
-                        elif snip['score'] >= 2:
-                            st.error("🚨 **INVALIDADO:** El mercado está rebotando. ¡Cuidado con la venta!")
-                        else:
-                            st.warning("⏳ **ESPERANDO CONFLUENCIA:** Tendencia mixta.")
-
-                with s_col2:
-                    fig_snip = go.Figure()
-                    fig_snip.add_trace(go.Scatter(x=snip['data'].index, y=snip['data']['Close'], name='Precio', line=dict(color='white', width=2)))
-                    fig_snip.add_trace(go.Scatter(x=snip['data'].index, y=snip['data']['VWAP'], name='VWAP', line=dict(color='cyan', dash='dash')))
-                    fig_snip.add_trace(go.Scatter(x=snip['data'].index, y=snip['data']['EMA20'], name='EMA 20', line=dict(color='magenta', width=1)))
-                    fig_snip.update_layout(height=260, margin=dict(l=0, r=0, t=0, b=0), showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-                    st.plotly_chart(fig_snip, use_container_width=True)
-                    
-                    # Latido del Miedo (VIX Intradía)
-                    if snip['vix_data'] is not None:
-                        vix_cur = snip['vix_data']['Close'].iloc[-1]
-                        vix_open = snip['vix_data']['Open'].iloc[0]
-                        vix_pct = ((vix_cur - vix_open) / vix_open) * 100
-                        
-                        vix_col = "red" if vix_pct > 0 else "green"
-                        st.caption(f"📉 **Latido del Miedo (VIX 5m):** {vix_cur:.2f} ({vix_pct:+.2f}%)")
-                        
-                        fig_vix = go.Figure()
-                        fig_vix.add_trace(go.Scatter(x=snip['vix_data'].index, y=snip['vix_data']['Close'], line=dict(color=vix_col, width=1), fill='tozeroy'))
-                        fig_vix.update_layout(height=100, margin=dict(l=0, r=0, t=0, b=0), showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(showgrid=False))
-                        st.plotly_chart(fig_vix, use_container_width=True)
-
-            else:
-                st.info("Esperando datos intradía para rastreo.")
-
-            # Lógica de Auto-refresco
-            if live_tracking:
-                time.sleep(60)
-                st.rerun()
-
-    with tab_history:
+    if active_tab == "📜 History":
+        # Centrar contenido si es necesario
         st.subheader("📚 Centro de Registro y Bitácora")
         
-        # Dos sub-pestañas internas o secciones
-        hist_sel = st.radio("Ver registros de:", ["📅 Diario de Operaciones (Scanner)", "🤖 Bitácora de Predicciones AI"], horizontal=True)
+        st.markdown("#### 🗒️ Operaciones Guardadas (SQLite Local)")
         
-        if hist_sel == "📅 Diario de Operaciones (Scanner)":
-            st.markdown("#### 🗒️ Operaciones Guardadas (SQLite Local)")
-            
-            # Botón para forzar actualización de precios (evita lentitud al cargar)
-            refresh_prices = st.button("🔄 Actualizar Precios Actuales")
-            
-            try:
-                journal_data = market_db.get_journal_entries()
-            except Exception as e:
-                st.error(f"Error al leer la base de datos: {e}")
-                journal_data = pd.DataFrame()
-            
-            if not journal_data.empty:
-                for idx, row in journal_data.iterrows():
-                    with st.expander(f"📌 {row['ticker']} | {row['entry_date']} | {row['verdict']}"):
-                        jcol1, jcol2, jcol3 = st.columns([1, 1, 1])
+        # Botón para forzar actualización de precios (evita lentitud al cargar)
+        refresh_prices = st.button("🔄 Actualizar Precios Actuales")
+        
+        try:
+            journal_data = market_db.get_journal_entries()
+        except Exception as e:
+            st.error(f"Error al leer la base de datos: {e}")
+            journal_data = pd.DataFrame()
+        
+        if not journal_data.empty:
+            for idx, row in journal_data.iterrows():
+                with st.expander(f"📌 {row['ticker']} | {row['entry_date']} | {row['verdict']}"):
+                    jcol1, jcol2, jcol3 = st.columns([1, 1, 1])
+                    
+                    cur_p = "N/D (Refresh)"
+                    perf = 0
+                    p_color = "#bbb"
+                    
+                    # Solo actualizar precios si el usuario lo pide
+                    if refresh_prices:
+                        try:
+                            cur_p_val = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
+                            cur_p = cur_p_val
+                            perf = ((cur_p / row['entry_price']) - 1) * 100
+                            p_color = "#28a745" if perf >= 0 else "#dc3545"
+                        except:
+                            cur_p = "Error Conexión"
+                    
+                    jcol1.metric("Precio Entrada", f"${row['entry_price']:.2f}")
+                    
+                    if isinstance(cur_p, (int, float)):
+                        jcol2.metric("Precio Actual", f"${cur_p:.2f}", delta=f"{perf:.2f}%")
+                    else:
+                        jcol2.metric("Precio Actual", str(cur_p))
                         
-                        cur_p = "N/D (Refresh)"
-                        perf = 0
-                        p_color = "#bbb"
-                        
-                        # Solo actualizar precios si el usuario lo pide
-                        if refresh_prices:
-                            try:
-                                cur_p_val = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
-                                cur_p = cur_p_val
-                                perf = ((cur_p / row['entry_price']) - 1) * 100
-                                p_color = "#28a745" if perf >= 0 else "#dc3545"
-                            except:
-                                cur_p = "Error Conexión"
-                        
-                        jcol1.metric("Precio Entrada", f"${row['entry_price']:.2f}")
-                        
-                        if isinstance(cur_p, (int, float)):
-                            jcol2.metric("Precio Actual", f"${cur_p:.2f}", delta=f"{perf:.2f}%")
-                        else:
-                            jcol2.metric("Precio Actual", str(cur_p))
-                            
-                        # Mostrar niveles de estrategia si existen (manejo de None para trades viejos)
-                        sl_v = row.get('sl_price') if row.get('sl_price') is not None else 0.0
-                        tp_v = row.get('tp_price') if row.get('tp_price') is not None else 0.0
-                        
-                        if float(sl_v) > 0 and float(tp_v) > 0:
-                            entry_p = float(row['entry_price'])
-                            risk = entry_p - float(sl_v)
-                            reward = float(tp_v) - entry_p
-                            rr = reward / risk if risk != 0 else 0
-                            jcol3.metric("Ratio R/R (IA)", f"1:{rr:.1f}")
-                        else:
-                            jcol3.metric("Score Original", f"{row['score']}/100")
+                    # Mostrar niveles de estrategia si existen (manejo de None para trades viejos)
+                    sl_v = row.get('sl_price') if row.get('sl_price') is not None else 0.0
+                    tp_v = row.get('tp_price') if row.get('tp_price') is not None else 0.0
+                    
+                    if float(sl_v) > 0 and float(tp_v) > 0:
+                        entry_p = float(row['entry_price'])
+                        risk = entry_p - float(sl_v)
+                        reward = float(tp_v) - entry_p
+                        rr = reward / risk if risk != 0 else 0
+                        jcol3.metric("Ratio R/R (IA)", f"1:{rr:.1f}")
+                    else:
+                        jcol3.metric("Score Original", f"{row['score']}/100")
 
                         
-                        if sl_v > 0 or tp_v > 0:
-                            st.markdown(f"**🛡️ Estrategia Sugerida:** SL: `${sl_v:.2f}` | TP: `${tp_v:.2f}`")
+                    if sl_v > 0 or tp_v > 0:
+                        st.markdown(f"**🛡️ Estrategia Sugerida:** SL: `${sl_v:.2f}` | TP: `${tp_v:.2f}`")
 
                         
-                        st.markdown("**🧠 Razonamiento IA:**")
-                        st.caption(row['reasoning'])
+                    st.markdown("**🧠 Razonamiento IA:**")
+                    st.caption(row['reasoning'])
                         
-                        # --- BOTONES DE ACCIÓN ---
-                        hcol1, hcol2, hcol3, hcol4 = st.columns(4)
+                    # --- BOTONES DE ACCIÓN ---
+                    hcol1, hcol2, hcol3, hcol4 = st.columns(4)
                         
-                        with hcol1:
-                            if st.button(f"🎯 Entrada", key=f"load_{row['id']}", use_container_width=True):
-                                st.session_state['calc_entry'] = float(row['entry_price'])
-                                if sl_v > 0: st.session_state['calc_stop'] = float(sl_v)
-                                if tp_v > 0: st.session_state['calc_tp'] = float(tp_v)
-                                st.rerun()
+                    with hcol1:
+                        if st.button(f"🎯 Entrada", key=f"load_{row['id']}", use_container_width=True):
+                            st.session_state['calc_entry'] = float(row['entry_price'])
+                            if sl_v > 0: st.session_state['calc_stop'] = float(sl_v)
+                            if tp_v > 0: st.session_state['calc_tp'] = float(tp_v)
+                            st.rerun()
                         
-                        with hcol2:
-                            if st.button(f"🧠 Estrategia", key=f"load_strat_{row['id']}", use_container_width=True):
-                                st.session_state['calc_entry'] = float(row['entry_price'])
-                                st.session_state['calc_stop'] = float(sl_v) if sl_v > 0 else float(row['entry_price']) * 0.95
-                                st.session_state['calc_tp'] = float(tp_v) if tp_v > 0 else float(row['entry_price']) * 1.10
-                                st.rerun()
+                    with hcol2:
+                        if st.button(f"🧠 Estrategia", key=f"load_strat_{row['id']}", use_container_width=True):
+                            st.session_state['calc_entry'] = float(row['entry_price'])
+                            st.session_state['calc_stop'] = float(sl_v) if sl_v > 0 else float(row['entry_price']) * 0.95
+                            st.session_state['calc_tp'] = float(tp_v) if tp_v > 0 else float(row['entry_price']) * 1.10
+                            st.rerun()
 
 
 
                         
-                        with hcol3:
-                            if st.button(f"📈 Actual", key=f"load_curr_{row['id']}", use_container_width=True):
-                                with st.spinner("Buscando..."):
-                                    try:
-                                        actual_p = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
-                                        st.session_state['calc_entry'] = float(actual_p)
-                                        st.session_state['calc_stop'] = float(sl_v) if sl_v > 0 else float(actual_p) * 0.95
-                                        st.session_state['calc_tp'] = float(tp_v) if tp_v > 0 else float(actual_p) * 1.10
-                                        st.rerun()
-                                    except: st.error("Error")
-
-
-
-                        
-                        with hcol4:
-                            if st.button(f"🗑️ Eliminar", key=f"del_{row['id']}", use_container_width=True):
-                                if market_db.delete_journal_entry(row['id']):
-                                    st.success("Removido")
-                                    time.sleep(1)
+                    with hcol3:
+                        if st.button(f"📈 Actual", key=f"load_curr_{row['id']}", use_container_width=True):
+                            with st.spinner("Buscando..."):
+                                try:
+                                    actual_p = yf.Ticker(row['ticker']).history(period='1d')['Close'].iloc[-1]
+                                    st.session_state['calc_entry'] = float(actual_p)
+                                    st.session_state['calc_stop'] = float(sl_v) if sl_v > 0 else float(actual_p) * 0.95
+                                    st.session_state['calc_tp'] = float(tp_v) if tp_v > 0 else float(actual_p) * 1.10
                                     st.rerun()
+                                except: st.error("Error")
 
 
 
-            else:
-                st.info("Tu bitácora está vacía. Guarda operaciones desde el Scanner.")
-        
+                        
+                    with hcol4:
+                        if st.button(f"🗑️ Eliminar", key=f"del_{row['id']}", use_container_width=True):
+                            if market_db.delete_journal_entry(row['id']):
+                                st.success("Removido")
+                                time.sleep(1)
+                                st.rerun()
+
+
+
         else:
-            st.markdown(f"#### 🤖 Registro de Predicciones: {ticker}")
-            history_df = market_db.get_predictions(ticker, limit=30)
-            if not history_df.empty:
-                history_df['Dirección'] = history_df['prediction_value'].map({1: 'Subida 🟢', 0: 'Bajada 🔴', -1: 'Neutral 🟡'})
-                st.dataframe(history_df[['execution_date', 'prediction_date', 'Dirección', 'prob_up', 'prob_down']], use_container_width=True, hide_index=True)
-            else:
-                st.info("No hay registros de predicciones para este activo aún.")
+            st.info("Tu bitácora está vacía. Guarda operaciones desde el Scanner.")
+        
 
 
 
