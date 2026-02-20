@@ -3436,22 +3436,52 @@ def main():
                             proposed_rows.append(row)
                             temp_cap += row['Capital Requerido']
                 
-                def generate_alt_portfolio(df, budget):
-                    import random
-                    cands = df.sort_values('annualized', ascending=False).head(40)
-                    if cands.empty: return []
-                    cands = cands.sample(frac=1).reset_index(drop=True)
+                def generate_alt_portfolio(df, budget, target_n=5):
+                    """Genera un portafolio inteligente con N activos objetivo, optimizando rendimiento y diversificación."""
+                    if df.empty: return []
+                    
+                    # Calcular capital máximo por posición para intentar encajar N activos
+                    max_per_position = budget / target_n if target_n > 0 else budget
+                    
+                    # Filtrar candidatos que caben en el presupuesto por posición
+                    eligible = df[df['Capital Requerido'] <= max_per_position].copy()
+                    
+                    # Si no hay suficientes candidatos baratos, ampliar gradualmente el filtro
+                    if len(eligible) < target_n:
+                        eligible = df[df['Capital Requerido'] <= budget * 0.5].copy()
+                    if len(eligible) < target_n:
+                        eligible = df.copy()
+                    
+                    # Score compuesto: Prima + Eficiencia de capital (rendimiento por dólar comprometido)
+                    eligible['efficiency'] = eligible['annualized'] / (eligible['Capital Requerido'] / 1000)
+                    eligible = eligible.sort_values('efficiency', ascending=False)
+                    
                     alt_sel = []
                     cap_u = 0
                     sec_c = {}
-                    for _, r in cands.iterrows():
+                    max_per_sector = max(1, target_n // 3) if target_n <= 6 else 2  # Diversificar más si piden pocos activos
+                    
+                    for _, r in eligible.iterrows():
+                        if len(alt_sel) >= target_n:
+                            break
                         req = r['Capital Requerido']
                         sec = r['Sector']
-                        if sec_c.get(sec, 0) >= 2: continue
+                        if sec_c.get(sec, 0) >= max_per_sector: continue
                         if cap_u + req <= budget:
                             alt_sel.append(r['Ticker'])
                             cap_u += req
                             sec_c[sec] = sec_c.get(sec, 0) + 1
+                    
+                    # Si no llenamos los N slots, hacer segunda pasada relajando sector
+                    if len(alt_sel) < target_n:
+                        for _, r in eligible.iterrows():
+                            if len(alt_sel) >= target_n: break
+                            if r['Ticker'] in alt_sel: continue
+                            req = r['Capital Requerido']
+                            if cap_u + req <= budget:
+                                alt_sel.append(r['Ticker'])
+                                cap_u += req
+                    
                     return alt_sel
 
                 def calc_score(pdf, budget):
@@ -3502,15 +3532,17 @@ def main():
                             """, unsafe_allow_html=True)
                     
                     st.markdown("<br>", unsafe_allow_html=True)
-                    b_col1, b_col2 = st.columns(2)
+                    b_col1, b_col2, b_col3 = st.columns([2, 1, 2])
                     with b_col1:
                         if st.button("🔄 Restablecer a Selección", use_container_width=True):
                             st.session_state['wheel_multi_selection_v2'] = auto_selected
                             st.session_state['wheel_ai_report'] = None
                             st.rerun()
                     with b_col2:
+                        target_assets = st.number_input("Nº Activos", min_value=1, max_value=15, value=5, step=1, help="Cantidad de activos deseados en la cartera propuesta")
+                    with b_col3:
                         if st.button("🎲 Proponer Otra Combinación", use_container_width=True, type='primary'):
-                            st.session_state['wheel_multi_selection_v2'] = generate_alt_portfolio(df_w, wheel_budget)
+                            st.session_state['wheel_multi_selection_v2'] = generate_alt_portfolio(df_w, wheel_budget, target_n=target_assets)
                             st.session_state['wheel_ai_report'] = None
                             st.rerun()
                 
