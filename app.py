@@ -3494,7 +3494,7 @@ def main():
 
                             st.markdown(f"""
                             <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:10px; border-left: 4px solid {border_color}; min-height: 120px;">
-                                <h4 style="margin:0; font-size:0.95em;">{row['Ticker']} {badge}</h4>
+                                <h4 style="margin:0; font-size:0.95em;">{row['Ticker']} (${row['Precio']:.2f}) {badge}</h4>
                                 <p style="font-size:0.65em; color:#aaa; margin-bottom:5px;">{sec_name}</p>
                                 <p style="margin:2px 0; font-size:0.8em;">Strike: <b>${row['Strike']}</b>{dte_str}</p>
                                 <p style="margin:5px 0 0 0; color:#28a745; font-weight:bold; font-size:0.85em;">{row['Anualizado']}</p>
