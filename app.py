@@ -3463,11 +3463,22 @@ def main():
                             border_color = "#28a745" if not is_strong else "#00d2ff"
                             badge = '<span style="color:#00d2ff; font-size:10px;">⚡ Fuerte</span>' if is_strong else ''
                             
+                            # Calcular DTE (Days to Expiration) de forma visual basándonos en Vencimiento
+                            dte_str = ""
+                            if 'Vencimiento' in row:
+                                try:
+                                    exp_date = pd.to_datetime(row['Vencimiento']).date()
+                                    today = get_ny_time().date()
+                                    dte = (exp_date - today).days
+                                    dte_str = f" | DTE: <b>{dte} días</b>"
+                                except:
+                                    pass
+
                             st.markdown(f"""
                             <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:10px; border-left: 4px solid {border_color}; min-height: 120px;">
                                 <h4 style="margin:0; font-size:0.95em;">{row['Ticker']} {badge}</h4>
                                 <p style="font-size:0.65em; color:#aaa; margin-bottom:5px;">{sec_name}</p>
-                                <p style="margin:2px 0; font-size:0.8em;">Strike: <b>${row['Strike']}</b></p>
+                                <p style="margin:2px 0; font-size:0.8em;">Strike: <b>${row['Strike']}</b>{dte_str}</p>
                                 <p style="margin:5px 0 0 0; color:#28a745; font-weight:bold; font-size:0.85em;">{row['Anualizado']}</p>
                             </div>
                             """, unsafe_allow_html=True)
