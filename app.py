@@ -614,7 +614,9 @@ def get_deep_financials(ticker):
         # --- BALANCE (Balance Sheet) ---
         balance_data = {}
         try:
-            bs = t.balance_sheet
+            bs = t.quarterly_balance_sheet
+            if bs is None or bs.empty:
+                bs = t.balance_sheet
             if bs is not None and not bs.empty:
                 latest = bs.iloc[:, 0]
                 def get_bs(s, keys):
