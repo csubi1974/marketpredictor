@@ -3360,7 +3360,8 @@ def main():
             else:
                 st.warning("Ninguno de los activos en el historial cumple con tu capital o precio máximo. Inicia un nuevo escaneo.")
         else:
-            st.info("👋 Bienvenida/o al Escáner de la Rueda. Haz clic en **Escaneas ~250 Activos** para construir tu primera base de datos de oportunidades.")
+            total_assets = len(get_complete_universe())
+            st.info(f"👋 Bienvenida/o al Escáner de la Rueda. Haz clic en **Escaneas {total_assets} Activos** para construir tu primera base de datos de oportunidades.")
 
 
     # --- DEEP DIVE TAB ---
