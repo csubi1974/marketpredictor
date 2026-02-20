@@ -149,7 +149,15 @@ def get_weinstein_stage(df):
     # Definición de etapas
     # Etapa 2: Avanzando (Precio > SMA + SMA subiendo)
     if dist > 0.02 and slope > 0.005:
-        return "Etapa 2 (Alcista / Avance)"
+        try:
+            # Validar volumen: volumen de hoy (o media reciente) vs media de 20 días
+            recent_vol = df['Volume'].iloc[-1]
+            avg_vol_20 = df['Volume'].tail(20).mean()
+            if avg_vol_20 > 0 and (recent_vol / avg_vol_20) > 2.0:
+                return "Etapa 2 (Valid. Vol)"
+        except:
+            pass
+        return "Etapa 2 (Alcista)"
     # Etapa 4: Declive (Precio < SMA + SMA bajando)
     elif dist < -0.02 and slope < -0.005:
         return "Etapa 4 (Bajista / Declive)"
@@ -1475,17 +1483,31 @@ SCANNER_UNIVERSE = [
 ]
 
 # Añadir más S&P 500 para llegar a ~260 (Top de Market Cap adicional)
-ADDITIONAL_UNIVERSE = [
-    'T', 'VZ', 'TMUS', 'DIS', 'CMCSA', 'CHTR', 'NFLX', 'SONY', 'PARA', 'WBD',
-    'ADP', 'PAYX', 'FIS', 'FISV', 'GPN', 'INTU', 'ADSK', 'ANSS', 'TEAM', 'ZM',
-    'SYK', 'BSX', 'EW', 'ZTS', 'IDXX', 'ALGN', 'A', 'STZ', 'BF-B', 'KDP', 'MDLZ',
-    'K', 'GIS', 'CPB', 'SJM', 'HSY', 'ADM', 'TSN', 'KHC', 'SYY', 'TFC', 'USB', 'PNC', 
-    'TROW', 'MET', 'PRU', 'AIG', 'TRV', 'CB', 'CME', 'ICE', 'ETN', 'ITW', 'EMR',
-    'WM', 'RSG', 'NSC', 'UNP', 'CSX', 'ODFL', 'MAR', 'EXPE', 'CCL', 'RCL', 'NCLH',
-    'DHR', 'A', 'TMO', 'WAT', 'VTRS', 'HCA', 'HUM', 'CI', 'CVS', 'CNC', 'MCK', 'COR',
-    'EOG', 'MPC', 'PSX', 'VLO', 'DVN', 'FANG', 'O', 'AMT', 'CCI', 'PLD',
-    'EQIX', 'PSA', 'DLR', 'VICI', 'WY', 'SPG', 'AVB', 'EQR'
-]
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sp500_universe():
+    try:
+        import requests
+        import io
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        html = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).text
+        table = pd.read_html(io.StringIO(html))
+        df = table[0]
+        tickers = df['Symbol'].tolist()
+        return [t.replace('.', '-') for t in tickers] # yf formatting for symbols like BRK.B
+    except:
+        return [
+            'T', 'VZ', 'TMUS', 'DIS', 'CMCSA', 'CHTR', 'NFLX', 'SONY', 'PARA', 'WBD',
+            'ADP', 'PAYX', 'FIS', 'FISV', 'GPN', 'INTU', 'ADSK', 'ANSS', 'TEAM', 'ZM',
+            'SYK', 'BSX', 'EW', 'ZTS', 'IDXX', 'ALGN', 'A', 'STZ', 'BRK-B', 'KDP', 'MDLZ',
+            'K', 'GIS', 'CPB', 'SJM', 'HSY', 'ADM', 'TSN', 'KHC', 'SYY', 'TFC', 'USB', 'PNC', 
+            'TROW', 'MET', 'PRU', 'AIG', 'TRV', 'CB', 'CME', 'ICE', 'ETN', 'ITW', 'EMR',
+            'WM', 'RSG', 'NSC', 'UNP', 'CSX', 'ODFL', 'MAR', 'EXPE', 'CCL', 'RCL', 'NCLH',
+            'DHR', 'TMO', 'WAT', 'VTRS', 'HCA', 'HUM', 'CI', 'CVS', 'CNC', 'MCK', 'COR',
+            'EOG', 'MPC', 'PSX', 'VLO', 'DVN', 'FANG', 'O', 'AMT', 'CCI', 'PLD',
+            'EQIX', 'PSA', 'DLR', 'VICI', 'WY', 'SPG', 'AVB', 'EQR'
+        ]
+
+ADDITIONAL_UNIVERSE = get_sp500_universe()
 
 SCANNER_UNIVERSE = sorted(list(set(SCANNER_UNIVERSE + ADDITIONAL_UNIVERSE)))
 
@@ -1545,6 +1567,15 @@ def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045)
             days_to_exp = (dt.strptime(target_date, '%Y-%m-%d') - today).days
             annualized = (yield_pct / days_to_exp) * 365
             
+            dte_earnings = None
+            try:
+                cal = t.calendar
+                if cal and 'Earnings Date' in cal and cal['Earnings Date']:
+                    earn_date = cal['Earnings Date'][0]
+                    dte_earnings = (earn_date - today.date()).days
+            except:
+                pass
+            
             return {
                 'Ticker': ticker,
                 'Sector': fin_data['general'].get('sector', 'N/D'),
@@ -1559,7 +1590,8 @@ def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045)
                 'annualized': annualized,
                 'Retorno': f"{yield_pct:.2f}%",
                 'Anualizado': f"{annualized:.1f}%",
-                'Vencimiento': target_date
+                'Vencimiento': target_date,
+                'Días a Earnings': dte_earnings
             }
     except Exception as e:
         print(f"Error Wheel {ticker}: {e}")
@@ -1609,7 +1641,8 @@ def get_wheel_recommendations(budget, max_price_filter=None):
     total = len(survivors)
     
     # Solo procesamos los sobrevivientes en paralelo (Llamadas caras de Opciones/Financials)
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    # Reducimos los workers a 4 para prevenir bloqueos por rate-limit
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(analyze_single_ticker_wheel, t, h, budget, max_price_filter): t for t, h in survivors}
         for i, future in enumerate(futures):
             ticker = futures[future]
@@ -1768,7 +1801,7 @@ def get_stock_fundamentals(ticker):
         return {
             'Sector': info.get('sector', 'N/D'),
             'Industry': info.get('industry', 'N/D'),
-            'Market Cap': info.get('marketCap', 0),
+            'Market Cap': info.get('marketCap', t.fast_info.get('marketCap', 0)),
             'P/E Ratio': info.get('trailingPE', info.get('forwardPE', 'N/D')),
             'Revenue Growth': info.get('revenueGrowth', 'N/D'),
             'Profit Margin': info.get('profitMargins', 'N/D'),
@@ -1998,6 +2031,11 @@ class MarketDB:
                 cursor.execute("ALTER TABLE scanner_cache ADD COLUMN dist_sma200 REAL")
             except:
                 pass
+                
+            try:
+                cursor.execute("ALTER TABLE wheel_cache ADD COLUMN dte_earnings INTEGER")
+            except:
+                pass
             
             conn.commit()
             conn.close()
@@ -2016,12 +2054,12 @@ class MarketDB:
                 
                 conn.execute('''
                     INSERT OR REPLACE INTO wheel_cache 
-                    (ticker, sector, price, w_stage, health, strike, delta, premium, collateral, yield_pct, annualized, expiration, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (ticker, sector, price, w_stage, health, strike, delta, premium, collateral, yield_pct, annualized, expiration, last_updated, dte_earnings)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     row['Ticker'], row['Sector'], row['Precio'], row['W Stage'], row['Salud'],
                     row['Strike'], row['Delta'], row['Prima'], row['Capital Requerido'],
-                    y_val, a_val, row['Vencimiento'], now
+                    y_val, a_val, row['Vencimiento'], now, row.get('Días a Earnings')
                 ))
             conn.commit()
             conn.close()
@@ -2037,12 +2075,15 @@ class MarketDB:
             if not df.empty:
                 df['Retorno'] = df['yield_pct'].apply(lambda x: f"{x:.2f}%")
                 df['Anualizado'] = df['annualized'].apply(lambda x: f"{x:.1f}%")
+                if 'dte_earnings' not in df.columns:
+                    df['dte_earnings'] = None
                 # Renombrar columnas para consistencia con la lógica existente
                 df = df.rename(columns={
                     'ticker': 'Ticker', 'sector': 'Sector', 'price': 'Precio',
                     'w_stage': 'W Stage', 'health': 'Salud', 'strike': 'Strike',
                     'delta': 'Delta', 'premium': 'Prima', 'collateral': 'Capital Requerido',
-                    'expiration': 'Vencimiento', 'last_updated': 'Última Actualización'
+                    'expiration': 'Vencimiento', 'last_updated': 'Última Actualización',
+                    'dte_earnings': 'Días a Earnings'
                 })
             return df
         except:
@@ -3119,10 +3160,10 @@ def main():
             wheel_max_p = st.number_input("💵 Precio Máximo Acción ($)", value=500, step=10, help="Límite máximo de precio por acción.")
         with w_col3:
             st.markdown("<br>", unsafe_allow_html=True)
-            run_wheel = st.button("🚀 Escanear ~250 Activos", use_container_width=True, type='primary', help="Inicia escaneo multihilo (3 min aprox)")
+            run_wheel = st.button(f"🚀 Escanear {len(SCANNER_UNIVERSE)} Activos", use_container_width=True, type='primary', help="Inicia escaneo multihilo")
             
         if run_wheel:
-            with st.spinner("🔬 Escaneando el universo de 250 acciones en paralelo..."):
+            with st.spinner(f"🔬 Escaneando el universo de {len(SCANNER_UNIVERSE)} acciones en paralelo..."):
                 # Escaneamos todo el universo (budget alto y sin filtro precio) para llenar el cache
                 wheel_df = get_wheel_recommendations(999999, 500) 
                 if not wheel_df.empty:
@@ -3147,13 +3188,27 @@ def main():
             
             if not df_w.empty:
                 # Formateo de tabla
+                def color_dte(val):
+                    try:
+                        v = float(val)
+                        if v < 15: return 'color: white; background-color: rgba(220, 53, 69, 0.7); font-weight: bold'
+                        elif v < 35: return 'color: #333; background-color: rgba(255, 193, 7, 0.7); font-weight: bold'
+                        else: return 'color: white; background-color: rgba(40, 167, 69, 0.7); font-weight: bold'
+                    except: pass
+                    return ''
+
                 def style_wheel(df):
-                    return df.style.format({
+                    s = df.style.format({
                         'Precio': '${:.2f}',
                         'Strike': '${:.2f}',
                         'Capital Requerido': '${:,.2f}',
-                        'Prima': '${:.2f}'
+                        'Prima': '${:.2f}',
+                        'Días a Earnings': '{:.0f}'
                     }).map(lambda x: 'color: #28a745; font-weight: bold', subset=['Anualizado'])
+                    
+                    if 'Días a Earnings' in df.columns:
+                        s = s.map(color_dte, subset=['Días a Earnings'])
+                    return s
 
                 st.dataframe(style_wheel(df_w), use_container_width=True, hide_index=True)
                 
@@ -3168,10 +3223,40 @@ def main():
                         proposed_rows.append(row)
                         temp_cap += row['Capital Requerido']
                 
+                def generate_alt_portfolio(df, budget):
+                    import random
+                    cands = df.sort_values('annualized', ascending=False).head(40)
+                    if cands.empty: return []
+                    cands = cands.sample(frac=1).reset_index(drop=True)
+                    alt_sel = []
+                    cap_u = 0
+                    sec_c = {}
+                    for _, r in cands.iterrows():
+                        req = r['Capital Requerido']
+                        sec = r['Sector']
+                        if sec_c.get(sec, 0) >= 2: continue
+                        if cap_u + req <= budget:
+                            alt_sel.append(r['Ticker'])
+                            cap_u += req
+                            sec_c[sec] = sec_c.get(sec, 0) + 1
+                    return alt_sel
+
+                def calc_score(pdf, budget):
+                    if pdf.empty: return 0
+                    u = min(100, (pdf['Capital Requerido'].sum() / budget) * 100)
+                    s = pdf['Sector'].value_counts().max() if not pdf.empty else 1
+                    p = max(0, (s - 1) * 15)
+                    r = min(100, pdf['annualized'].mean() * 200)
+                    return int(max(0, min(100, (u*0.4) + (r*0.6) - p)))
+
                 # --- SECCIÓN: PROPUESTA INICIAL (VISUAL) ---
                 st.markdown("---")
                 st.subheader("🏗️ Propuesta de Portafolio Diversificado")
-                st.caption(f"Selección recomendada para optimizar tus ${wheel_budget:,.0f} evitando concentración sectorial.")
+                
+                auto_df = df_w[df_w['Ticker'].isin(auto_selected)]
+                auto_score = calc_score(auto_df, wheel_budget)
+                
+                st.caption(f"Selección recomendada original para optimizar tus ${wheel_budget:,.0f} evitando concentración sectorial. **⭐ Score: {auto_score}/100**")
                 
                 if proposed_rows:
                     p_cols = st.columns(len(proposed_rows))
@@ -3186,10 +3271,18 @@ def main():
                             </div>
                             """, unsafe_allow_html=True)
                     
-                    if st.button("🔄 Restablecer a Selección Propuesta", use_container_width=True):
-                        st.session_state['wheel_multi_selection_v2'] = auto_selected
-                        st.session_state['wheel_ai_report'] = None
-                        st.rerun()
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    b_col1, b_col2 = st.columns(2)
+                    with b_col1:
+                        if st.button("🔄 Restablecer a Selección Original", use_container_width=True):
+                            st.session_state['wheel_multi_selection_v2'] = auto_selected
+                            st.session_state['wheel_ai_report'] = None
+                            st.rerun()
+                    with b_col2:
+                        if st.button("🎲 Proponer Otra Combinación", use_container_width=True, type='primary'):
+                            st.session_state['wheel_multi_selection_v2'] = generate_alt_portfolio(df_w, wheel_budget)
+                            st.session_state['wheel_ai_report'] = None
+                            st.rerun()
                 
                 # --- INTERACTOR DE PORTAFOLIO ---
                 st.markdown("### 🛠️ Personalizar Selección")
@@ -3216,15 +3309,26 @@ def main():
                 
                 # Métricas de Portafolio
                 st.markdown("<br>", unsafe_allow_html=True)
-                m_col1, m_col2, m_col3 = st.columns(3)
+                m_col1, m_col2, m_col3, m_col4 = st.columns(4)
                 m_col1.metric("Capital Utilizado", f"${total_used:,.0f}", delta=f"{ (total_used/wheel_budget)*100:.1f}%", delta_color="normal")
                 m_col2.metric("Disponible", f"${remaining:,.0f}", delta=f"${wheel_budget:,.0f} Total", delta_color="off")
                 m_col3.metric("Prima Mensual Est.", f"${portfolio_df['Prima'].sum()*100:,.2f}")
                 
+                curr_score = calc_score(portfolio_df, wheel_budget)
+                sc_delta = "Óptimo 🚀" if curr_score >= 80 else "Aceptable" if curr_score >= 50 else "Mejorable"
+                sc_color = "normal" if curr_score >= 80 else "off" if curr_score >= 50 else "inverse"
+                m_col4.metric("⭐ Score Portafolio", f"{curr_score}/100", delta=sc_delta, delta_color=sc_color)
+                
                 # Visualización Detallada del Portafolio Actual
                 if not portfolio_df.empty:
                     st.write("📋 **Tu Selección Actual:**")
-                    st.dataframe(portfolio_df[['Ticker', 'Sector', 'Strike', 'Prima', 'Anualizado', 'Capital Requerido']], use_container_width=True, hide_index=True)
+                    disp_cols = ['Ticker', 'Sector', 'Strike', 'Prima', 'Anualizado', 'Capital Requerido']
+                    if 'Días a Earnings' in portfolio_df.columns:
+                        disp_cols.append('Días a Earnings')
+                        styled_p = portfolio_df[disp_cols].style.map(color_dte, subset=['Días a Earnings']).format({'Días a Earnings': '{:.0f}', 'Strike': '${:.2f}', 'Prima': '${:.2f}', 'Capital Requerido': '${:,.2f}'})
+                        st.dataframe(styled_p, use_container_width=True, hide_index=True)
+                    else:
+                        st.dataframe(portfolio_df[disp_cols], use_container_width=True, hide_index=True)
                     
                     if remaining < 0:
                         st.error(f"⚠️ ¡Has superado tu capital por ${abs(remaining):,.0f}! Revisa tu selección.")
