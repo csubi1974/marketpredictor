@@ -1685,21 +1685,39 @@ def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045)
         for _, put in puts.iterrows():
             strike = put['strike']
             iv = put['impliedVolatility']
-            if strike >= curr_price or iv < 0.01: continue
-            calc_d = calculate_delta(curr_price, strike, T, r, iv, 'put')
+            bid = put.get('bid', 0)
+            ask = put.get('ask', 0)
+            
+            # Filtros estrictos de liquidez y validez
+            if strike >= curr_price or iv < 0.01 or bid <= 0:
+                continue
+                
+            # Preferir el Delta de la API si existe y es válido, sino calcularlo
+            calc_d = 0
+            api_delta = put.get('delta', None)
+            if pd.notna(api_delta) and api_delta != 0:
+                calc_d = float(api_delta)
+            else:
+                calc_d = calculate_delta(curr_price, strike, T, r, iv, 'put')
+                
+            # Buscamos el Delta más cercano a -0.30
+            # Como calc_d y la meta (-0.30) son negativos, usamos abs(calc_d - (-0.30))
             diff = abs(calc_d - (-0.30))
             if diff < min_delta_diff:
                 min_delta_diff = diff
                 best_put = put
-                best_put['delta'] = calc_d
+                best_put['delta_used'] = calc_d
         
         if best_put is not None:
-            premium = (best_put['bid'] + best_put['ask']) / 2
-            if premium <= 0: premium = best_put['lastPrice']
+            # Usar siempre el precio medio (Mark) para primas realistas
+            bid = best_put.get('bid', 0)
+            ask = best_put.get('ask', 0)
+            premium = (bid + ask) / 2
+            
             collateral = best_put['strike'] * 100
-            yield_pct = (premium * 100 / collateral) * 100
+            yield_pct = (premium / best_put['strike']) * 100
             days_to_exp = (dt.strptime(target_date, '%Y-%m-%d') - today).days
-            annualized = (yield_pct / days_to_exp) * 365
+            annualized = (yield_pct / days_to_exp) * 365 if days_to_exp > 0 else 0
             
             dte_earnings = None
             try:
@@ -1717,7 +1735,7 @@ def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045)
                 'W Stage': w_stage,
                 'Salud': f"{health['total']}/100",
                 'Strike': best_put['strike'],
-                'Delta': round(best_put['delta'], 2),
+                'Delta': round(best_put['delta_used'], 2),
                 'Prima': round(premium, 2),
                 'Capital Requerido': collateral,
                 'yield_pct': yield_pct,
