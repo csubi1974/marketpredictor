@@ -1459,32 +1459,31 @@ def calculate_delta(S, K, T, r, sigma, option_type='call'):
         return norm.cdf(d1) - 1
 
 # --- MOMENTUM SCANNER ---
-SCANNER_UNIVERSE = [
-    # Índices y ETFs (Líquidos para Opciones)
-    'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLV', 'XLY', 'XLE', 'XLI', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC',
-    'SMH', 'SOXX', 'IBB', 'XBI', 'GLD', 'SLV', 'TLT', 'EEM', 'GDX', 'KRE', 'XOP', 'XRT', 'TAN', 'ARKK',
-    # Tecnología / Megacaps (Líquidos)
-    'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'NFLX', 'AVGO', 'CSCO', 'ADBE', 'ORCL', 'CRM', 
-    'AMD', 'INTC', 'TXN', 'QCOM', 'MU', 'AMAT', 'LRCX', 'ADI', 'PANW', 'FTNT', 'CRWD', 'SNPS', 'CDNS',
-    'SHOP', 'SQ', 'PYPL', 'PLTR', 'SNOW', 'MDB', 'TEAM', 'WDAY', 'NOW', 'DDOG', 'ZS', 'OKTA', 'NET', 'DOCU',
-    # Consumo / Retail
-    'WMT', 'COST', 'HD', 'LOW', 'TGT', 'NKE', 'SBUX', 'MCD', 'COKE', 'PEP', 'PG', 'CL', 'EL', 'PM', 'MO',
-    'LULU', 'TJX', 'MAR', 'HLT', 'BKNG', 'ABNB', 'DASH', 'UBER', 'LYFT', 'RIVN', 'LCID', 'F', 'GM',
-    # Financiero
-    'JPM', 'BAC', 'GS', 'MS', 'AXP', 'V', 'MA', 'COF', 'C', 'WFC', 'BLK', 'SPGI', 'MCO', 'PYPL', 'HOOD', 'COIN',
-    # Salud / Pharma
-    'LLY', 'UNH', 'JNJ', 'PFE', 'ABBV', 'MRK', 'AMGN', 'GILD', 'BMY', 'VRTX', 'REGN', 'ISRG', 'TMO', 'DHR',
-    # Energía / Materiales / Industrials
-    'XOM', 'CVX', 'SLB', 'COP', 'OXY', 'CAT', 'DE', 'GE', 'HON', 'MMM', 'UPS', 'FDX', 'LMT', 'RTX', 'BA', 'NOC',
-    'LIN', 'APD', 'FCX', 'NEM', 'NUE', 'AA', 'VALE', 'BHP', 'RIO',
-    # Otros Growth / Mid-Cap / Relevantes
-    'MELI', 'BABA', 'JD', 'PDD', 'SE', 'CPNG', 'NU', 'DKNG', 'PINS', 'SNAP', 'ROKU', 'U', 'RBLX', 'MSTR', 'MARA', 'RIOT',
-    'AFRM', 'UPST', 'SOFI', 'AI', 'ARM', 'SMCI', 'PLUG', 'RUN', 'ENPH', 'FSLR', 'TSM', 'ASML', 'GME', 'AMC'
-]
-
-# Añadir más S&P 500 para llegar a ~260 (Top de Market Cap adicional)
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_sp500_universe():
+def get_complete_universe():
+    base_universe = [
+        # Índices y ETFs (Líquidos para Opciones)
+        'SPY', 'QQQ', 'IWM', 'DIA', 'XLK', 'XLF', 'XLV', 'XLY', 'XLE', 'XLI', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC',
+        'SMH', 'SOXX', 'IBB', 'XBI', 'GLD', 'SLV', 'TLT', 'EEM', 'GDX', 'KRE', 'XOP', 'XRT', 'TAN', 'ARKK',
+        # Tecnología / Megacaps (Líquidos)
+        'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 'NFLX', 'AVGO', 'CSCO', 'ADBE', 'ORCL', 'CRM', 
+        'AMD', 'INTC', 'TXN', 'QCOM', 'MU', 'AMAT', 'LRCX', 'ADI', 'PANW', 'FTNT', 'CRWD', 'SNPS', 'CDNS',
+        'SHOP', 'SQ', 'PYPL', 'PLTR', 'SNOW', 'MDB', 'TEAM', 'WDAY', 'NOW', 'DDOG', 'ZS', 'OKTA', 'NET', 'DOCU',
+        # Consumo / Retail
+        'WMT', 'COST', 'HD', 'LOW', 'TGT', 'NKE', 'SBUX', 'MCD', 'COKE', 'PEP', 'PG', 'CL', 'EL', 'PM', 'MO',
+        'LULU', 'TJX', 'MAR', 'HLT', 'BKNG', 'ABNB', 'DASH', 'UBER', 'LYFT', 'RIVN', 'LCID', 'F', 'GM',
+        # Financiero
+        'JPM', 'BAC', 'GS', 'MS', 'AXP', 'V', 'MA', 'COF', 'C', 'WFC', 'BLK', 'SPGI', 'MCO', 'PYPL', 'HOOD', 'COIN',
+        # Salud / Pharma
+        'LLY', 'UNH', 'JNJ', 'PFE', 'ABBV', 'MRK', 'AMGN', 'GILD', 'BMY', 'VRTX', 'REGN', 'ISRG', 'TMO', 'DHR',
+        # Energía / Materiales / Industrials
+        'XOM', 'CVX', 'SLB', 'COP', 'OXY', 'CAT', 'DE', 'GE', 'HON', 'MMM', 'UPS', 'FDX', 'LMT', 'RTX', 'BA', 'NOC',
+        'LIN', 'APD', 'FCX', 'NEM', 'NUE', 'AA', 'VALE', 'BHP', 'RIO',
+        # Otros Growth / Mid-Cap / Relevantes
+        'MELI', 'BABA', 'JD', 'PDD', 'SE', 'CPNG', 'NU', 'DKNG', 'PINS', 'SNAP', 'ROKU', 'U', 'RBLX', 'MSTR', 'MARA', 'RIOT',
+        'AFRM', 'UPST', 'SOFI', 'AI', 'ARM', 'SMCI', 'PLUG', 'RUN', 'ENPH', 'FSLR', 'TSM', 'ASML', 'GME', 'AMC'
+    ]
+    
     try:
         import requests
         import io
@@ -1492,10 +1491,10 @@ def get_sp500_universe():
         html = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).text
         table = pd.read_html(io.StringIO(html))
         df = table[0]
-        tickers = df['Symbol'].tolist()
-        return [t.replace('.', '-') for t in tickers] # yf formatting for symbols like BRK.B
+        sp500 = [t.replace('.', '-') for t in df['Symbol'].tolist()]
+        return sorted(list(set(base_universe + sp500)))
     except:
-        return [
+        fallback = [
             'T', 'VZ', 'TMUS', 'DIS', 'CMCSA', 'CHTR', 'NFLX', 'SONY', 'PARA', 'WBD',
             'ADP', 'PAYX', 'FIS', 'FISV', 'GPN', 'INTU', 'ADSK', 'ANSS', 'TEAM', 'ZM',
             'SYK', 'BSX', 'EW', 'ZTS', 'IDXX', 'ALGN', 'A', 'STZ', 'BRK-B', 'KDP', 'MDLZ',
@@ -1506,10 +1505,8 @@ def get_sp500_universe():
             'EOG', 'MPC', 'PSX', 'VLO', 'DVN', 'FANG', 'O', 'AMT', 'CCI', 'PLD',
             'EQIX', 'PSA', 'DLR', 'VICI', 'WY', 'SPG', 'AVB', 'EQR'
         ]
+        return sorted(list(set(base_universe + fallback)))
 
-ADDITIONAL_UNIVERSE = get_sp500_universe()
-
-SCANNER_UNIVERSE = sorted(list(set(SCANNER_UNIVERSE + ADDITIONAL_UNIVERSE)))
 
 def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045):
     """Procesa un solo ticker para el ciclo de la Rueda usando datos pre-filtrados."""
@@ -1603,7 +1600,7 @@ def get_wheel_recommendations(budget, max_price_filter=None):
     Optimizado para evitar rate-limits de Yahoo Finance.
     """
     results = []
-    WHEEL_UNIVERSE = SCANNER_UNIVERSE 
+    WHEEL_UNIVERSE = get_complete_universe() 
     
     with st.spinner(f"🚀 Pre-escaneando {len(WHEEL_UNIVERSE)} activos..."):
         try:
@@ -1748,12 +1745,13 @@ def analyze_single_ticker_momentum(ticker, hist, price_min, price_max, min_volum
 def scan_momentum_stocks(price_min, price_max, min_volume, smooth_momentum=False):
     """Escanea el universo usando descargas masivas (Bulk) para máxima velocidad y seguridad."""
     results = []
+    universe = get_complete_universe()
     
-    with st.spinner(f"🚀 Descargando datos de {len(SCANNER_UNIVERSE)} activos..."):
+    with st.spinner(f"🚀 Descargando datos de {len(universe)} activos..."):
         try:
             # Descargar TODO el universo en una sola petición (Ahorra ~250 peticiones)
             # Usamos 1y para tener suficiente historial para SMA 150 (Weinstein)
-            data = yf.download(SCANNER_UNIVERSE, period='1y', interval='1d', group_by='ticker', progress=False, auto_adjust=True)
+            data = yf.download(universe, period='1y', interval='1d', group_by='ticker', progress=False, auto_adjust=True)
         except Exception as e:
             st.error(f"Error en descarga masiva: {e}")
             return pd.DataFrame()
@@ -1765,7 +1763,7 @@ def scan_momentum_stocks(price_min, price_max, min_volume, smooth_momentum=False
     status_text = st.empty()
     
     # Procesar cada ticker del dataframe masivo
-    for i, ticker in enumerate(SCANNER_UNIVERSE):
+    for i, ticker in enumerate(universe):
         try:
             # Extraer el historial de este ticker específico del gran DataFrame
             if ticker in data.columns.get_level_values(0):
@@ -1776,7 +1774,7 @@ def scan_momentum_stocks(price_min, price_max, min_volume, smooth_momentum=False
         except:
             continue
             
-        progress_bar.progress((i + 1) / len(SCANNER_UNIVERSE))
+        progress_bar.progress((i + 1) / len(universe))
         status_text.caption(f"Analizando {ticker}...")
 
     progress_bar.empty()
@@ -3160,10 +3158,11 @@ def main():
             wheel_max_p = st.number_input("💵 Precio Máximo Acción ($)", value=500, step=10, help="Límite máximo de precio por acción.")
         with w_col3:
             st.markdown("<br>", unsafe_allow_html=True)
-            run_wheel = st.button(f"🚀 Escanear {len(SCANNER_UNIVERSE)} Activos", use_container_width=True, type='primary', help="Inicia escaneo multihilo")
+            universe = get_complete_universe()
+            run_wheel = st.button(f"🚀 Escanear {len(universe)} Activos", use_container_width=True, type='primary', help="Inicia escaneo multihilo")
             
         if run_wheel:
-            with st.spinner(f"🔬 Escaneando el universo de {len(SCANNER_UNIVERSE)} acciones en paralelo..."):
+            with st.spinner(f"🔬 Escaneando el universo de {len(universe)} acciones en paralelo..."):
                 # Escaneamos todo el universo (budget alto y sin filtro precio) para llenar el cache
                 wheel_df = get_wheel_recommendations(999999, 500) 
                 if not wheel_df.empty:
