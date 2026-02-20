@@ -1387,8 +1387,110 @@ def get_alpha_pilot_response(api_key, user_input, chat_history):
         return f"Error de conexión con AlphaPilot: {e}"
 
 
-def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
-    """Realiza un análisis estratégico de un portafolio de la Rueda usando IA."""
+def calculate_portfolio_correlation(tickers):
+    """Calcula correlaciones, betas y simulación de caída para un portafolio vs SPY."""
+    try:
+        # Descarga focalizada: solo los tickers del portafolio + SPY como benchmark
+        all_tickers = list(set(tickers + ['SPY']))
+        data = yf.download(all_tickers, period='6mo', interval='1d', auto_adjust=True, progress=False)
+        
+        # Extraer precios de cierre
+        if isinstance(data.columns, pd.MultiIndex):
+            closes = data['Close'].dropna()
+        else:
+            closes = data[['Close']].dropna()
+            closes.columns = all_tickers
+        
+        if closes.empty or len(closes) < 30:
+            return None
+        
+        # Retornos diarios porcentuales
+        returns = closes.pct_change().dropna()
+        
+        # --- 1. Matriz de correlación completa ---
+        corr_matrix = returns.corr()
+        
+        # --- 2. Beta y correlación individual vs SPY ---
+        spy_var = returns['SPY'].var()
+        individual_stats = []
+        
+        for t in tickers:
+            if t not in returns.columns or t == 'SPY':
+                continue
+            cov_with_spy = returns[t].cov(returns['SPY'])
+            beta = cov_with_spy / spy_var if spy_var > 0 else 1.0
+            corr_spy = corr_matrix.loc[t, 'SPY'] if t in corr_matrix.index else 0
+            # Volatilidad anualizada
+            vol = returns[t].std() * np.sqrt(252) * 100
+            individual_stats.append({
+                'ticker': t,
+                'beta': round(beta, 2),
+                'corr_spy': round(corr_spy, 2),
+                'volatility': round(vol, 1)
+            })
+        
+        # --- 3. Correlación promedio entre activos del portafolio (diversificación) ---
+        port_tickers = [t for t in tickers if t in corr_matrix.index and t != 'SPY']
+        avg_corr = 0
+        pair_count = 0
+        high_corr_pairs = []
+        
+        for i, t1 in enumerate(port_tickers):
+            for t2 in port_tickers[i+1:]:
+                c = corr_matrix.loc[t1, t2]
+                avg_corr += c
+                pair_count += 1
+                if c > 0.75:
+                    high_corr_pairs.append(f"{t1}/{t2}: {c:.2f}")
+        
+        avg_corr = round(avg_corr / pair_count, 2) if pair_count > 0 else 0
+        
+        # Clasificación de diversificación
+        if avg_corr < 0.35:
+            div_label = "EXCELENTE (Baja correlación)"
+        elif avg_corr < 0.55:
+            div_label = "BUENA (Correlación moderada)"
+        elif avg_corr < 0.75:
+            div_label = "LIMITADA (Alta correlación)"
+        else:
+            div_label = "POBRE (Muy alta correlación — activos se mueven juntos)"
+        
+        # --- 4. Simulación de caída -10% SPY ---
+        simulated_losses = []
+        for stat in individual_stats:
+            loss = round(stat['beta'] * -10.0, 1)
+            simulated_losses.append({'ticker': stat['ticker'], 'loss': loss, 'beta': stat['beta']})
+        
+        # Beta ponderado (asumimos pesos iguales si no tenemos capital por ticker)
+        if individual_stats:
+            avg_beta = round(sum(s['beta'] for s in individual_stats) / len(individual_stats), 2)
+            portfolio_loss = round(avg_beta * -10.0, 1)
+        else:
+            avg_beta = 1.0
+            portfolio_loss = -10.0
+        
+        # Activo más/menos vulnerable
+        most_vulnerable = max(simulated_losses, key=lambda x: abs(x['loss'])) if simulated_losses else None
+        most_defensive = min(simulated_losses, key=lambda x: abs(x['loss'])) if simulated_losses else None
+        
+        return {
+            'individual_stats': individual_stats,
+            'avg_correlation': avg_corr,
+            'diversification_label': div_label,
+            'high_corr_pairs': high_corr_pairs,
+            'avg_beta': avg_beta,
+            'portfolio_loss_sim': portfolio_loss,
+            'simulated_losses': simulated_losses,
+            'most_vulnerable': most_vulnerable,
+            'most_defensive': most_defensive
+        }
+    except Exception as e:
+        print(f"Error calculating portfolio correlation: {e}")
+        return None
+
+
+def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget, correlation_data=None):
+    """Realiza un análisis estratégico de un portafolio de la Rueda usando IA, con datos de correlación reales."""
     if not api_key: return "Configura la API Key para el análisis."
 
     
@@ -1407,6 +1509,39 @@ def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
     
     sector_str = ", ".join([f"{k} ({v})" for k, v in sectors.items()])
     
+    # --- Construir sección de correlación para el prompt ---
+    correlation_section = ""
+    if correlation_data:
+        correlation_section = f"""
+    
+    ═══ ANÁLISIS DE CORRELACIÓN (Datos reales últimos 6 meses) ═══
+    Correlación promedio entre activos: {correlation_data['avg_correlation']} → Diversificación: {correlation_data['diversification_label']}
+    Beta ponderado del portafolio vs S&P 500: {correlation_data['avg_beta']}
+    """
+        
+        # Betas individuales
+        if correlation_data['individual_stats']:
+            correlation_section += "\n    Betas individuales vs SPY:\n"
+            for stat in correlation_data['individual_stats']:
+                correlation_section += f"    - {stat['ticker']}: β={stat['beta']} | Correlación SPY: {stat['corr_spy']} | Volatilidad anualizada: {stat['volatility']}%\n"
+        
+        # Pares altamente correlacionados (riesgo de concentración oculta)
+        if correlation_data['high_corr_pairs']:
+            correlation_section += f"\n    ⚠️ PARES CON ALTA CORRELACIÓN (>0.75): {', '.join(correlation_data['high_corr_pairs'])}\n"
+        
+        # Simulación de caída
+        correlation_section += f"""
+    ═══ SIMULACIÓN: CAÍDA -10% DEL S&P 500 ═══
+    Pérdida estimada del portafolio: {correlation_data['portfolio_loss_sim']}%
+    """
+        for sim in correlation_data.get('simulated_losses', []):
+            correlation_section += f"    - {sim['ticker']}: {sim['loss']}% (β={sim['beta']})\n"
+        
+        if correlation_data.get('most_vulnerable'):
+            correlation_section += f"    → Activo MÁS vulnerable: {correlation_data['most_vulnerable']['ticker']} ({correlation_data['most_vulnerable']['loss']}%)\n"
+        if correlation_data.get('most_defensive'):
+            correlation_section += f"    → Activo MÁS defensivo: {correlation_data['most_defensive']['ticker']} ({correlation_data['most_defensive']['loss']}%)\n"
+    
     prompt = f"""
     Eres un experto en gestión de riesgos y estrategias de opciones (The Wheel). 
     Analiza este portafolio de Cash Secured Puts:
@@ -1417,19 +1552,21 @@ def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
     
     ACTIVOS SELECCIONADOS:
     {chr(10).join(portfolio_summary)}
+    {correlation_section}
     
     OBJETIVO DEL ANÁLISIS:
-    1. CONCENTRACIÓN: ¿Hay demasiada exposición a un solo sector o activo?
-    2. RIESGO SISTÉMICO: ¿Cómo se comportaría este portafolio ante una caída del 10% del S&P 500?
-    3. SALUD FINANCIERA: ¿Son empresas robustas para mantener en caso de asignación?
-    4. VERDICTO ESTRATÉGICO: Asigna una calificación del 1 al 10 al riesgo y da un veredicto formal.
+    1. CONCENTRACIÓN: ¿Hay demasiada exposición a un solo sector o activo? Usa los datos de correlación si están disponibles para identificar concentración oculta (activos de distintos sectores que se mueven juntos).
+    2. RIESGO SISTÉMICO: Usando los Betas y la simulación de caída, explica con números concretos cómo impactaría una corrección del S&P 500. Identifica el activo más riesgoso y el más defensivo.
+    3. DIVERSIFICACIÓN REAL: Analiza la correlación promedio entre activos. Si es alta (>0.65), advierte que la diversificación sectorial es superficial. Si es baja (<0.40), destaca la fortaleza del portafolio.
+    4. SALUD FINANCIERA: ¿Son empresas robustas para mantener en caso de asignación?
+    5. VERDICTO ESTRATÉGICO: Asigna una calificación del 1 al 10 al riesgo y da un veredicto formal.
     
     REGLAS CRÍTICAS (ZERO HALLUCINATION):
-    - No inventes precios ni datos financieros. 
-    - Basa tus conclusiones ÚNICAMENTE en los números proporcionados arriba.
-    - Si falta algún dato para una conclusión, menciónalo en lugar de suponerlo.
+    - No inventes datos. Basa tus conclusiones ÚNICAMENTE en los números proporcionados arriba.
+    - Si los datos de correlación están disponibles, ÚSALOS para dar un análisis cuantitativo preciso.
+    - Sé directo y accionable. No uses frases genéricas como "no hay información suficiente".
     
-    Responde en Español, con un tono profesional y directo. Usa Markdown.
+    Responde en Español, con un tono profesional e institucional. Usa Markdown con headers ##.
     """
     
     try:
@@ -1438,7 +1575,7 @@ def ai_wheel_portfolio_analysis(api_key, portfolio_df, total_budget):
             "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.1,
-            "max_tokens": 1500
+            "max_tokens": 2000
         }
         resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=30)
         if resp.status_code == 200:
@@ -3342,8 +3479,10 @@ def main():
                     with ai_col1:
                         if st.button("🧠 Análisis de Salud del Portafolio (IA)", use_container_width=True, type='primary'):
                             if groq_api_key:
-                                with st.spinner("Analizando robustez del portafolio..."):
-                                    report = ai_wheel_portfolio_analysis(groq_api_key, portfolio_df, wheel_budget)
+                                with st.spinner("📊 Calculando correlaciones y betas del portafolio..."):
+                                    corr_data = calculate_portfolio_correlation(selected_tickers)
+                                with st.spinner("🧠 Generando análisis estratégico con IA..."):
+                                    report = ai_wheel_portfolio_analysis(groq_api_key, portfolio_df, wheel_budget, correlation_data=corr_data)
                                     st.session_state['wheel_ai_report'] = report
                             else:
                                 st.warning("Configura la API Key para este análisis.")
