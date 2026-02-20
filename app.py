@@ -1689,8 +1689,11 @@ def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045)
             ask = put.get('ask', 0)
             
             # Filtros estrictos de liquidez y validez
-            if strike >= curr_price or iv < 0.01 or bid <= 0:
+            # Tolerancia máxima de Spread: El Ask no puede ser más de 4 veces el Bid
+            if strike >= curr_price or iv < 0.01 or bid <= 0.0:
                 continue
+            if ask > (bid * 4) and (ask - bid) > 0.50:
+                continue # Rechaza spreads tóxicos (ej: Bid 0.20, Ask 4.80)
                 
             # Preferir el Delta de la API si existe y es válido, sino calcularlo
             calc_d = 0
@@ -1709,10 +1712,14 @@ def analyze_single_ticker_wheel(ticker, hist, budget, max_price_filter, r=0.045)
                 best_put['delta_used'] = calc_d
         
         if best_put is not None:
-            # Usar siempre el precio medio (Mark) para primas realistas
+            # Usar precio BID (compra real de mercado) para calcular rendimientos conservadores
+            # Esto aplasta naturalmente el rendimiento de opciones ilíquidas con spreads gigantes
             bid = best_put.get('bid', 0)
             ask = best_put.get('ask', 0)
-            premium = (bid + ask) / 2
+            premium = bid # En lugar de (bid+ask)/2, asumimos la peor ejecución
+            
+            if premium <= 0:
+                return None
             
             collateral = best_put['strike'] * 100
             yield_pct = (premium / best_put['strike']) * 100
