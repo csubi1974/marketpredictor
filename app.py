@@ -2044,7 +2044,7 @@ class MarketDB:
         if df.empty: return
         try:
             conn = sqlite3.connect(self.db_file)
-            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            now = get_ny_time().strftime('%Y-%m-%d %H:%M:%S')
             for _, row in df.iterrows():
                 # Limpiar % de las cadenas si subieron como string
                 y_val = float(str(row['Retorno']).replace('%', '')) if isinstance(row['Retorno'], str) else row['Retorno']
@@ -2092,7 +2092,7 @@ class MarketDB:
         if df.empty: return
         try:
             conn = sqlite3.connect(self.db_file)
-            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            now = get_ny_time().strftime('%Y-%m-%d %H:%M:%S')
             # Limpiar tabla antes de insertar (reemplazo completo)
             conn.execute('DELETE FROM scanner_cache')
             for _, row in df.iterrows():
@@ -2201,7 +2201,7 @@ class MarketDB:
         conn = None
         try:
             conn = sqlite3.connect(self.db_file)
-            now = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            now = get_ny_time().strftime('%Y-%m-%d %H:%M:%S')
             
             # --- CONVERSIÓN ESTRICTA DE TIPOS ---
             t_val = str(ticker)
@@ -2381,7 +2381,7 @@ def main():
 
     # --- VALORES DERIVADOS ---
     selected_stock = 'Apple (AAPL)'
-    end_date = dt.now().date()
+    end_date = get_ny_time().date()
     default_start = end_date - timedelta(days=1825)
     start_date = default_start
     ticker = TOP_20_STOCKS.get(selected_stock, 'AAPL')
