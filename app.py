@@ -3348,16 +3348,75 @@ def main():
 
                 st.dataframe(style_wheel(df_w), use_container_width=True, hide_index=True)
                 
+                # --- OBTENER FUERZA DE SECTORES ---
+                market_ctx = get_market_context()
+                sector_strength = {}
+                if market_ctx and 'Sectors' in market_ctx:
+                    df_sectors = market_ctx['Sectors']
+                    # Crear diccionario: Nombre del Sector -> Puntuación de Fuerza
+                    # Mapeo invertido porque en The Wheel tenemos nombres completos, no tickers del sector
+                    for _, s_row in df_sectors.iterrows():
+                        sector_strength[s_row['Name']] = s_row['Score']
+
                 # --- LÓGICA DE SELECCIÓN AUTOMÁTICA (PROPUESTA) ---
-                div_candidates = df_w.sort_values('annualized', ascending=False).drop_duplicates('Sector')
-                auto_selected = []
-                temp_cap = 0
-                proposed_rows = []
-                for _, row in div_candidates.iterrows():
-                    if temp_cap + row['Capital Requerido'] <= wheel_budget:
-                        auto_selected.append(row['Ticker'])
-                        proposed_rows.append(row)
-                        temp_cap += row['Capital Requerido']
+                st.markdown("---")
+                st.subheader("🏗️ Propuesta de Portafolio Diversificado")
+                
+                # Checkbox para Optimizar por Fuerza Sectorial
+                optimize_sectors = st.checkbox(
+                    "🎯 Optimizar por Fuerza Sectorial (Smart Alpha)", 
+                    value=False, 
+                    help="Si se activa, el algoritmo inclinará el portafolio combinando los sectores con mayor Momentum alcista + las mejores primas. Excluirá los sectores más débiles."
+                )
+                
+                div_candidates = df_w.copy()
+                
+                if optimize_sectors and sector_strength:
+                    # Aplicar peso combinado: Retorno Anualizado (60%) + Fuerza Sector (40%)
+                    max_ann = div_candidates['annualized'].max() if div_candidates['annualized'].max() > 0 else 1
+                    max_score = max(sector_strength.values()) if sector_strength.values() and max(sector_strength.values()) > 0 else 1
+                    
+                    def combined_score(row):
+                        ann_norm = (row['annualized'] / max_ann) * 100
+                        s_name = row['Sector']
+                        sec_score = sector_strength.get(s_name, 0)
+                        sec_norm = (sec_score / max_score) * 100 if max_score > 0 else 50
+                        return (ann_norm * 0.6) + (sec_norm * 0.4)
+                    
+                    div_candidates['smart_score'] = div_candidates.apply(combined_score, axis=1)
+                    
+                    # Filtrar activos de los sectores con peor desempeño (score negativo o en el bottom 20% relativo)
+                    min_acceptable_sec_score = min(max_score * 0.2, 0) if max_score > 0 else -10 # Umbral de corte
+                    valid_sectors = [s_name for s_name, _score in sector_strength.items() if _score > min_acceptable_sec_score]
+                    div_candidates = div_candidates[div_candidates['Sector'].isin(valid_sectors)]
+                    
+                    # Ordenar por el score combinado inteligente, permitiendo hasta 2 activos del mismo sector top
+                    div_candidates = div_candidates.sort_values('smart_score', ascending=False)
+                    
+                    # Lógica de selección con inclinación
+                    auto_selected = []
+                    temp_cap = 0
+                    proposed_rows = []
+                    sector_counts = {}
+                    
+                    for _, row in div_candidates.iterrows():
+                        sec = row['Sector']
+                        if temp_cap + row['Capital Requerido'] <= wheel_budget and sector_counts.get(sec, 0) < 2:
+                            auto_selected.append(row['Ticker'])
+                            proposed_rows.append(row)
+                            temp_cap += row['Capital Requerido']
+                            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+                else:
+                    # Lógica clásica (solo rentabilidad, 1 por sector)
+                    div_candidates = div_candidates.sort_values('annualized', ascending=False).drop_duplicates('Sector')
+                    auto_selected = []
+                    temp_cap = 0
+                    proposed_rows = []
+                    for _, row in div_candidates.iterrows():
+                        if temp_cap + row['Capital Requerido'] <= wheel_budget:
+                            auto_selected.append(row['Ticker'])
+                            proposed_rows.append(row)
+                            temp_cap += row['Capital Requerido']
                 
                 def generate_alt_portfolio(df, budget):
                     import random
@@ -3386,22 +3445,28 @@ def main():
                     return int(max(0, min(100, (u*0.4) + (r*0.6) - p)))
 
                 # --- SECCIÓN: PROPUESTA INICIAL (VISUAL) ---
-                st.markdown("---")
-                st.subheader("🏗️ Propuesta de Portafolio Diversificado")
-                
                 auto_df = df_w[df_w['Ticker'].isin(auto_selected)]
                 auto_score = calc_score(auto_df, wheel_budget)
                 
-                st.caption(f"Selección recomendada original para optimizar tus ${wheel_budget:,.0f} evitando concentración sectorial. **⭐ Score: {auto_score}/100**")
+                if optimize_sectors:
+                    st.caption(f"Selección sesgada inteligentemente hacia sectores fuertes de mercado. **⭐ Score: {auto_score}/100**")
+                else:
+                    st.caption(f"Selección recomendada priorizando prima y diversificación estándar. **⭐ Score: {auto_score}/100**")
                 
                 if proposed_rows:
                     p_cols = st.columns(len(proposed_rows))
                     for col, row in zip(p_cols, proposed_rows):
                         with col:
+                            # Indicador visual si el sector es fuerte
+                            sec_name = row['Sector']
+                            is_strong = optimize_sectors and sector_strength.get(sec_name, 0) > 0
+                            border_color = "#28a745" if not is_strong else "#00d2ff"
+                            badge = '<span style="color:#00d2ff; font-size:10px;">⚡ Fuerte</span>' if is_strong else ''
+                            
                             st.markdown(f"""
-                            <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:10px; border-left: 4px solid #28a745; min-height: 120px;">
-                                <h4 style="margin:0; font-size:0.95em;">{row['Ticker']}</h4>
-                                <p style="font-size:0.65em; color:#aaa; margin-bottom:5px;">{row['Sector']}</p>
+                            <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:10px; border-left: 4px solid {border_color}; min-height: 120px;">
+                                <h4 style="margin:0; font-size:0.95em;">{row['Ticker']} {badge}</h4>
+                                <p style="font-size:0.65em; color:#aaa; margin-bottom:5px;">{sec_name}</p>
                                 <p style="margin:2px 0; font-size:0.8em;">Strike: <b>${row['Strike']}</b></p>
                                 <p style="margin:5px 0 0 0; color:#28a745; font-weight:bold; font-size:0.85em;">{row['Anualizado']}</p>
                             </div>
@@ -3410,7 +3475,7 @@ def main():
                     st.markdown("<br>", unsafe_allow_html=True)
                     b_col1, b_col2 = st.columns(2)
                     with b_col1:
-                        if st.button("🔄 Restablecer a Selección Original", use_container_width=True):
+                        if st.button("🔄 Restablecer a Selección", use_container_width=True):
                             st.session_state['wheel_multi_selection_v2'] = auto_selected
                             st.session_state['wheel_ai_report'] = None
                             st.rerun()
