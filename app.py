@@ -628,7 +628,13 @@ def get_deep_financials(ticker):
                 balance_data['totalLiabilities'] = get_bs(latest, ['Total Liabilities Net Minority Interest', 'Total Liabilities As Reported', 'Total Debt'])
                 balance_data['totalEquity'] = get_bs(latest, ['Stockholders Equity', 'Total Equity Gross Minority Interest', 'Common Stock Equity'])
                 balance_data['cash'] = get_bs(latest, ['Cash And Cash Equivalents', 'Cash Cash Equivalents And Short Term Investments'])
-                balance_data['totalDebt'] = get_bs(latest, ['Total Debt', 'Long Term Debt'])
+                
+                # Sincronizar deuda con el dato de info (Headline Debt) para evitar discrepancias
+                info_debt = info.get('totalDebt', 0)
+                if info_debt and info_debt > 0:
+                    balance_data['totalDebt'] = float(info_debt)
+                else:
+                    balance_data['totalDebt'] = get_bs(latest, ['Total Debt', 'Long Term Debt'])
         except:
             pass
  
